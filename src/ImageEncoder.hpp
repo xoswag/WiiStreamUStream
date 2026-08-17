@@ -14,19 +14,21 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ****************************************************************************/
-#ifndef _MJPEG_STREAM_SERVER_WINDOW_H_
-#define _MJPEG_STREAM_SERVER_WINDOW_H_
+#pragma once
 
-#include "JpegInformation.h"
+#include <stdint.h>
 
-class MJPEGStreamServer {
-public:
-    MJPEGStreamServer(){
-    }
-    virtual ~MJPEGStreamServer(){
-    }
+/**
+ * Owns the encoder thread: pulls captured frames, turns them into JPEGs and
+ * hands them to StreamSender.
+ */
+namespace ImageEncoder {
 
-    virtual bool streamJPEG(JpegInformation * info) = 0;
-};
+bool Start();
 
-#endif //_MJPEG_STREAM_SERVER_WINDOW_H_
+/** Signals the thread, waits for it to exit and releases everything it owned. */
+void Stop();
+
+bool IsRunning();
+
+} // namespace ImageEncoder

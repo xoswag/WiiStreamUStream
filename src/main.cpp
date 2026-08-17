@@ -1,91 +1,138 @@
-#include <map>
-#include <string>
-#include <wups.h>
-#include <wups/config.h>
-#include <wups/config/WUPSConfig.h>
-#include <wups/config/WUPSConfigItemMultipleValues.h>
-#include <utils/logger.h>
+/****************************************************************************
+ * Copyright (C) 2018 Maschell
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ ****************************************************************************/
+#include "ControlServer.hpp"
+#include "ImageEncoder.hpp"
+#include "ScreenCapture.hpp"
+#include "StreamProtocol.h"
+#include "StreamSender.hpp"
+#include "config.hpp"
 #include "retain_vars.hpp"
-#include "EncodingHelper.h"
-#include "MJPEGStreamServerUDP.hpp"
-#include "HeartBeatServer.hpp"
+#include "utils/logger.h"
 
-// Mandatory plugin information.
-WUPS_PLUGIN_NAME("Gamepad streaming tool.");
-WUPS_PLUGIN_DESCRIPTION("Streams the screen via HTTP to a browser. Open http://<ip of your wii u>:8000 on a browser in the same network.");
-WUPS_PLUGIN_VERSION("v0.1");
+#include <coreinit/cache.h>
+#include <wups.h>
+
+WUPS_PLUGIN_NAME("Screen Streaming");
+WUPS_PLUGIN_DESCRIPTION("Streams the TV or GamePad screen to a PC over the network. "
+                        "Run the StreamingPluginClient on your computer and enter this console's IP.");
+WUPS_PLUGIN_VERSION("v0.2");
 WUPS_PLUGIN_AUTHOR("Maschell");
 WUPS_PLUGIN_LICENSE("GPL");
 
-// Something is using "write"...
-WUPS_FS_ACCESS()
+WUPS_USE_STORAGE("screenstreaming");
 
-void resolutionChanged(WUPSConfigItemMultipleValues* configItem, int32_t newResolution) {
-    DEBUG_FUNCTION_LINE("Resolution changed %d \n",newResolution);
-    gResolution = newResolution;
+namespace {
 
-    // Restart server.
-    EncodingHelper::destroyInstance();
-    EncodingHelper::getInstance()->StartAsyncThread();
-    EncodingHelper::getInstance()->setMJPEGStreamServer(HeartBeatServer::getInstance()->getMJPEGServer());
-}
+bool sPipelineRunning = false;
 
-void screenChanged(WUPSConfigItemMultipleValues* configItem, int32_t newScreen) {
-    DEBUG_FUNCTION_LINE("Screen changed %d \n",newScreen);
-    gScreen = newScreen;
-
-    // Restart server.
-    EncodingHelper::destroyInstance();
-    EncodingHelper::getInstance()->StartAsyncThread();
-    EncodingHelper::getInstance()->setMJPEGStreamServer(HeartBeatServer::getInstance()->getMJPEGServer());
-}
-
-WUPS_GET_CONFIG() {
-    WUPSConfig* config = new WUPSConfig("Streaming Plugin");
-    WUPSConfigCategory* catOther = config->addCategory("Main");
-
-    std::map<int32_t,std::string> resolutionValues;
-    resolutionValues[WUPS_STREAMING_RESOLUTION_240P] = "240p";
-    resolutionValues[WUPS_STREAMING_RESOLUTION_360P] = "360p";
-    resolutionValues[WUPS_STREAMING_RESOLUTION_480P] = "480p";
-
-    std::map<int32_t,std::string> screenValues;
-    screenValues[WUPS_STREAMING_SCREEN_DRC] = "Gamepad";
-    screenValues[WUPS_STREAMING_SCREEN_TV] = "TV";
-
-    //                    item Type             config id           displayed name              default value  onChangeCallback.
-    catOther->addItem(new WUPSConfigItemMultipleValues("screen", "Screen", gScreen, screenValues, screenChanged));
-    catOther->addItem(new WUPSConfigItemMultipleValues("resolution", "Streaming resolution", gResolution, resolutionValues, resolutionChanged));
-
-    return config;
-}
-
-// Gets called once the loader exists.
-INITIALIZE_PLUGIN() {
-    socket_lib_init();
-
-    log_init();
-}
-
-// Called whenever an application was started.
-ON_APPLICATION_START(my_args) {
-    socket_lib_init();
-    log_init();
-
-    gAppStatus = WUPS_APP_STATUS_FOREGROUND;
-
-    EncodingHelper::destroyInstance();
-    EncodingHelper::getInstance()->StartAsyncThread();
-    EncodingHelper::getInstance()->setMJPEGStreamServer(HeartBeatServer::getInstance()->getMJPEGServer());
-
-    log_init();
-}
-
-ON_APP_STATUS_CHANGED(status) {
-    gAppStatus = status;
-
-    if(status == WUPS_APP_STATUS_CLOSED) {
-        EncodingHelper::destroyInstance();
-        HeartBeatServer::destroyInstance();
+void startPipeline() {
+    if (sPipelineRunning) {
+        return;
     }
+
+    if (!ScreenCapture::Init()) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to set up the capture buffers");
+        return;
+    }
+    if (!ImageEncoder::Start()) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to start the encoder");
+        ScreenCapture::Shutdown();
+        return;
+    }
+    if (!ControlServer::Start()) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to start the control server");
+        ImageEncoder::Stop();
+        ScreenCapture::Shutdown();
+        return;
+    }
+
+    sPipelineRunning = true;
+    DEBUG_FUNCTION_LINE("Ready - connect the client to TCP %d", STREAM_TCP_PORT);
+}
+
+/**
+ * Teardown order is the whole point of this function.
+ *
+ * Close the gates, wait for a capture that is already running on the game's
+ * render thread, stop the threads, and only then release the buffers those
+ * threads were reading. Upstream freed as it went and raced itself.
+ */
+void stopPipeline() {
+    if (!sPipelineRunning) {
+        return;
+    }
+    sPipelineRunning = false;
+
+    gClientConnected = false;
+    gHasForeground   = false;
+    OSMemoryBarrier();
+    StreamWaitForCapturesToFinish();
+
+    ControlServer::Stop();
+    ImageEncoder::Stop();
+    ScreenCapture::Shutdown();
+
+    DEBUG_FUNCTION_LINE("Pipeline stopped");
+}
+
+} // namespace
+
+INITIALIZE_PLUGIN() {
+    initLogging();
+    StreamSender::InitOnce();
+    StreamConfig::Init();
+    DEBUG_FUNCTION_LINE("Screen Streaming plugin initialised");
+}
+
+DEINITIALIZE_PLUGIN() {
+    deinitLogging();
+}
+
+ON_APPLICATION_START() {
+    initLogging();
+
+    gHasForeground   = true;
+    gClientConnected = false;
+    OSMemoryBarrier();
+
+    startPipeline();
+}
+
+ON_APPLICATION_ENDS() {
+    stopPipeline();
+    deinitLogging();
+}
+
+ON_APPLICATION_REQUESTS_EXIT() {
+    // Stop capturing before the title starts tearing its own GX2 state down.
+    gHasForeground = false;
+    OSMemoryBarrier();
+    StreamWaitForCapturesToFinish();
+}
+
+ON_ACQUIRED_FOREGROUND() {
+    gHasForeground = true;
+    OSMemoryBarrier();
+}
+
+ON_RELEASE_FOREGROUND() {
+    // The HOME menu is taking over; the GX2 state we capture from is not ours
+    // to touch while we are in the background.
+    gHasForeground = false;
+    OSMemoryBarrier();
+    StreamWaitForCapturesToFinish();
 }

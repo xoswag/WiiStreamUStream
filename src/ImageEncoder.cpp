@@ -1,0 +1,477 @@
+/****************************************************************************
+ * Copyright (C) 2018 Maschell
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ ****************************************************************************/
+#include "ImageEncoder.hpp"
+#include "ScreenCapture.hpp"
+#include "StreamSender.hpp"
+#include "retain_vars.hpp"
+#include "utils/logger.h"
+
+#include <coreinit/cache.h>
+#include <coreinit/thread.h>
+#include <coreinit/time.h>
+#include <malloc.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <turbojpeg.h>
+
+namespace ImageEncoder {
+namespace {
+
+constexpr uint32_t THREAD_STACK_SIZE = 0x40000;
+
+/**
+ * 4:2:0, not upstream's 4:1:1. Both store a quarter of the chroma, but 4:2:0 is
+ * the format every JPEG decoder is tuned for and it subsamples vertically as
+ * well as horizontally, which suits real game footage better.
+ */
+constexpr int JPEG_SUBSAMPLING = TJSAMP_420;
+
+OSThread *sThread = nullptr;
+void *sThreadStack = nullptr;
+
+tjhandle sTjHandle = nullptr;
+
+uint8_t *sJpegBuffer = nullptr;
+unsigned long sJpegCapacity = 0;
+
+uint8_t *sScratchRGB = nullptr;
+uint32_t sScratchCapacity = 0;
+
+// Per-column source bounds for the downscale, rebuilt only when the width changes.
+uint32_t *sColStart = nullptr;
+uint32_t *sColEnd = nullptr;
+uint32_t sColCapacity = 0;
+
+uint8_t sSrgbLut[256];
+
+bool ensureColumnTable(uint32_t dstW) {
+    if (sColCapacity >= dstW && sColStart != nullptr && sColEnd != nullptr) {
+        return true;
+    }
+    free(sColStart);
+    free(sColEnd);
+    sColStart = (uint32_t *) malloc(dstW * sizeof(uint32_t));
+    sColEnd   = (uint32_t *) malloc(dstW * sizeof(uint32_t));
+    if (sColStart == nullptr || sColEnd == nullptr) {
+        free(sColStart);
+        free(sColEnd);
+        sColStart    = nullptr;
+        sColEnd      = nullptr;
+        sColCapacity = 0;
+        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the resample column table");
+        return false;
+    }
+    sColCapacity = dstW;
+    return true;
+}
+
+void buildSrgbLut() {
+    for (int i = 0; i < 256; i++) {
+        const float v = (float) i / 255.0f;
+        const float s = (v <= 0.0031308f) ? (v * 12.92f)
+                                          : (1.055f * powf(v, 1.0f / 2.4f) - 0.055f);
+        int out = (int) (s * 255.0f + 0.5f);
+        if (out < 0) out = 0;
+        if (out > 255) out = 255;
+        sSrgbLut[i] = (uint8_t) out;
+    }
+}
+
+/** Longest edge allowed for the configured capture size, 0 meaning "no limit". */
+void targetLimits(uint32_t &maxW, uint32_t &maxH) {
+    switch (gCaptureSize) {
+        case WUPS_STREAMING_SIZE_720P: maxW = 1280; maxH = 720; break;
+        case WUPS_STREAMING_SIZE_480P: maxW = 854;  maxH = 480; break;
+        case WUPS_STREAMING_SIZE_360P: maxW = 640;  maxH = 360; break;
+        case WUPS_STREAMING_SIZE_240P: maxW = 426;  maxH = 240; break;
+        case WUPS_STREAMING_SIZE_NATIVE:
+        default:                       maxW = 0;    maxH = 0;   break;
+    }
+}
+
+/**
+ * Downscale never upscales: sending more pixels than the console rendered costs
+ * encode time and bandwidth and adds no detail. So a game that renders 854x480
+ * stays 854x480 even on the 720p setting, and the client scales it for display.
+ */
+void computeTargetSize(uint32_t srcW, uint32_t srcH, uint32_t &dstW, uint32_t &dstH) {
+    uint32_t maxW, maxH;
+    targetLimits(maxW, maxH);
+
+    if (maxW == 0 || (srcW <= maxW && srcH <= maxH)) {
+        dstW = srcW;
+        dstH = srcH;
+        return;
+    }
+
+    const double scale = (double) maxW / srcW < (double) maxH / srcH
+                                 ? (double) maxW / srcW
+                                 : (double) maxH / srcH;
+
+    dstW = (uint32_t) (srcW * scale + 0.5);
+    dstH = (uint32_t) (srcH * scale + 0.5);
+
+    // Even dimensions keep the 4:2:0 chroma planes exact.
+    dstW &= ~1u;
+    dstH &= ~1u;
+
+    if (dstW < 16) dstW = 16;
+    if (dstH < 16) dstH = 16;
+}
+
+bool ensureScratch(uint32_t bytes) {
+    if (sScratchCapacity >= bytes) {
+        return true;
+    }
+    free(sScratchRGB);
+    sScratchRGB = (uint8_t *) malloc(bytes);
+    if (sScratchRGB == nullptr) {
+        sScratchCapacity = 0;
+        DEBUG_FUNCTION_LINE_ERR("Failed to allocate %u bytes of scratch", bytes);
+        return false;
+    }
+    sScratchCapacity = bytes;
+    return true;
+}
+
+bool ensureJpegBuffer(uint32_t w, uint32_t h) {
+    const unsigned long needed = tjBufSize((int) w, (int) h, JPEG_SUBSAMPLING);
+    if (sJpegCapacity >= needed && sJpegBuffer != nullptr) {
+        return true;
+    }
+    tjFree(sJpegBuffer);
+    sJpegBuffer = (uint8_t *) tjAlloc((int) needed);
+    if (sJpegBuffer == nullptr) {
+        sJpegCapacity = 0;
+        DEBUG_FUNCTION_LINE_ERR("Failed to allocate %lu bytes for the JPEG buffer", needed);
+        return false;
+    }
+    sJpegCapacity = needed;
+    return true;
+}
+
+/**
+ * Area-average downscale, optionally applying sRGB encoding, writing tightly
+ * packed RGB. One pass over the source does both jobs, and dropping the alpha
+ * channel means the JPEG encoder then reads 25% less memory.
+ *
+ * The surface is UNORM_R8_G8_B8_A8 and the console is big-endian, so a 32-bit
+ * load yields 0xRRGGBBAA.
+ */
+bool resampleToRGB(const uint32_t *src, uint32_t srcPitchPx, uint32_t srcW, uint32_t srcH,
+                   uint8_t *dst, uint32_t dstW, uint32_t dstH, bool applySrgb) {
+    // 1:1 - no averaging, no division at all. This is the path a 720p game on
+    // the default settings takes whenever colour correction is on, so it must
+    // not go anywhere near the general resampler below: that one does five
+    // integer divisions per output pixel, two of them 64-bit (and so libgcc
+    // calls, since PPC32 has no 64-bit divide), to compute sx0 = dx, sx1 = dx+1
+    // and n = 1.
+    if (dstW == srcW && dstH == srcH) {
+        for (uint32_t y = 0; y < dstH; y++) {
+            const uint32_t *row = src + (size_t) y * srcPitchPx;
+            if (applySrgb) {
+                for (uint32_t x = 0; x < dstW; x++) {
+                    const uint32_t p = row[x];
+                    *dst++ = sSrgbLut[(p >> 24) & 0xFF];
+                    *dst++ = sSrgbLut[(p >> 16) & 0xFF];
+                    *dst++ = sSrgbLut[(p >> 8) & 0xFF];
+                }
+            } else {
+                for (uint32_t x = 0; x < dstW; x++) {
+                    const uint32_t p = row[x];
+                    *dst++ = (uint8_t) (p >> 24);
+                    *dst++ = (uint8_t) (p >> 16);
+                    *dst++ = (uint8_t) (p >> 8);
+                }
+            }
+        }
+        return true;
+    }
+
+    // Real downscale. The column bounds depend only on dx, so compute them once
+    // for the whole image instead of re-dividing on every row.
+    if (!ensureColumnTable(dstW)) {
+        return false;
+    }
+    for (uint32_t dx = 0; dx < dstW; dx++) {
+        uint32_t sx0 = (uint32_t) ((uint64_t) dx * srcW / dstW);
+        uint32_t sx1 = (uint32_t) ((uint64_t) (dx + 1) * srcW / dstW);
+        if (sx1 <= sx0) sx1 = sx0 + 1;
+        if (sx1 > srcW) sx1 = srcW;
+        sColStart[dx] = sx0;
+        sColEnd[dx]   = sx1;
+    }
+
+    for (uint32_t dy = 0; dy < dstH; dy++) {
+        uint32_t sy0 = (uint32_t) ((uint64_t) dy * srcH / dstH);
+        uint32_t sy1 = (uint32_t) ((uint64_t) (dy + 1) * srcH / dstH);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > srcH) sy1 = srcH;
+
+        for (uint32_t dx = 0; dx < dstW; dx++) {
+            const uint32_t sx0 = sColStart[dx];
+            const uint32_t sx1 = sColEnd[dx];
+
+            uint32_t r = 0, g = 0, b = 0, n = 0;
+            for (uint32_t sy = sy0; sy < sy1; sy++) {
+                const uint32_t *row = src + (size_t) sy * srcPitchPx;
+                for (uint32_t sx = sx0; sx < sx1; sx++) {
+                    const uint32_t p = row[sx];
+                    r += (p >> 24) & 0xFF;
+                    g += (p >> 16) & 0xFF;
+                    b += (p >> 8) & 0xFF;
+                    n++;
+                }
+            }
+
+            uint8_t rr = (uint8_t) (r / n);
+            uint8_t gg = (uint8_t) (g / n);
+            uint8_t bb = (uint8_t) (b / n);
+
+            if (applySrgb) {
+                rr = sSrgbLut[rr];
+                gg = sSrgbLut[gg];
+                bb = sSrgbLut[bb];
+            }
+
+            *dst++ = rr;
+            *dst++ = gg;
+            *dst++ = bb;
+        }
+    }
+    return true;
+}
+
+void encodeAndSend(CaptureSlot *slot) {
+    const GX2Surface &surface = slot->colorBuffer.surface;
+
+    const uint32_t srcW     = surface.width;
+    const uint32_t srcH     = surface.height;
+    const uint32_t srcPitch = surface.pitch; // in pixels
+
+    if (surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || surface.image == nullptr) {
+        DEBUG_FUNCTION_LINE_ERR("Unexpected capture surface (format 0x%08X)", surface.format);
+        return;
+    }
+
+    // Invalidate on the core that is about to read. dcbi only affects the cache
+    // of the core executing it, so doing this in the GX2 hook (which runs on the
+    // game's render thread, on a different core) would not help this thread at
+    // all - and would put a 115k-block cache walk on the game's critical path.
+    DCInvalidateRange(surface.image, surface.imageSize);
+
+    uint32_t dstW, dstH;
+    computeTargetSize(srcW, srcH, dstW, dstH);
+
+    const bool applySrgb = (gColorMode == WUPS_STREAMING_COLOR_AUTO) && slot->sourceIsSRGB;
+    const bool needsPass = (dstW != srcW) || (dstH != srcH) || applySrgb;
+
+    if (!ensureJpegBuffer(dstW, dstH)) {
+        return;
+    }
+
+    const uint8_t *encodeSrc;
+    int encodePixelFormat;
+    int encodePitch;
+
+    if (needsPass) {
+        if (!ensureScratch(dstW * dstH * 3)) {
+            return;
+        }
+        if (!resampleToRGB((const uint32_t *) surface.image, srcPitch, srcW, srcH,
+                           sScratchRGB, dstW, dstH, applySrgb)) {
+            return; // scratch is only partly written - encoding it would send garbage
+        }
+        encodeSrc         = sScratchRGB;
+        encodePixelFormat = TJPF_RGB;
+        encodePitch       = (int) (dstW * 3);
+    } else {
+        // Nothing to correct and nothing to resize: hand the captured surface
+        // straight to the encoder. This is the 720p-native path and it is the
+        // reason 720p is affordable at all.
+        encodeSrc         = (const uint8_t *) surface.image;
+        encodePixelFormat = TJPF_RGBA;
+        encodePitch       = (int) (srcPitch * 4);
+    }
+
+    int quality = gQuality;
+    if (quality < STREAM_QUALITY_MIN) quality = STREAM_QUALITY_MIN;
+    if (quality > STREAM_QUALITY_MAX) quality = STREAM_QUALITY_MAX;
+
+    unsigned long jpegSize = sJpegCapacity;
+    unsigned char *jpegBuf = sJpegBuffer;
+
+    // TJFLAG_NOREALLOC keeps turbojpeg from allocating per frame; TJFLAG_FASTDCT
+    // is worth a lot here because the Espresso has no AltiVec, so libjpeg-turbo
+    // runs its plain-C path and the DCT dominates.
+    const int rc = tjCompress2(sTjHandle, encodeSrc, (int) dstW, encodePitch, (int) dstH,
+                               encodePixelFormat, &jpegBuf, &jpegSize,
+                               JPEG_SUBSAMPLING, quality,
+                               TJFLAG_NOREALLOC | TJFLAG_FASTDCT);
+    if (rc != 0) {
+        DEBUG_FUNCTION_LINE_ERR("tjCompress2 failed: %s", tjGetErrorStr());
+        return;
+    }
+
+    StreamSender::SendFrame(sJpegBuffer, (uint32_t) jpegSize);
+}
+
+int threadEntry(int /*argc*/, const char ** /*argv*/) {
+    DEBUG_FUNCTION_LINE("Encoder thread running");
+
+    OSTime lastReport = OSGetTime();
+    uint32_t encoded  = 0;
+    (void) encoded; // only read by the DEBUG-only log below
+
+    // The stop sentinel is the *only* exit. Checking sShouldExit here as well
+    // would let a thread that was mid-encode when Stop() was called leave the
+    // sentinel sitting in the queue, where the next encoder thread would pop it
+    // and die immediately - which is exactly what changing "Encoder core" from
+    // the config menu does.
+    for (;;) {
+        CaptureSlot *slot = ScreenCapture::WaitForFrame();
+        if (slot == nullptr) {
+            break;
+        }
+
+        encodeAndSend(slot);
+        ScreenCapture::ReleaseFrame(slot);
+        encoded++;
+
+        const OSTime now = OSGetTime();
+        if (OSTicksToSeconds(now - lastReport) >= 5) {
+            DEBUG_FUNCTION_LINE("%u frames encoded in the last 5s (captured %u, dropped %u, send failures %u)",
+                                encoded, ScreenCapture::GetCapturedCount(),
+                                ScreenCapture::GetSkippedCount(), StreamSender::GetSendFailures());
+            encoded    = 0;
+            lastReport = now;
+            ScreenCapture::ResetCounters();
+        }
+    }
+
+    DEBUG_FUNCTION_LINE("Encoder thread stopping");
+    return 0;
+}
+
+} // namespace
+
+bool Start() {
+    if (sThread != nullptr) {
+        return true;
+    }
+
+    buildSrgbLut();
+
+    // Set up the compressor here rather than inside the thread. If it failed in
+    // the thread body, the thread would exit before reaching its loop while
+    // sThread stayed non-null - so IsRunning() would claim a live encoder, and a
+    // later Stop() would push a stop sentinel that nobody consumes, killing the
+    // *next* encoder thread on its first wait.
+    sTjHandle = tjInitCompress();
+    if (sTjHandle == nullptr) {
+        DEBUG_FUNCTION_LINE_ERR("tjInitCompress failed: %s", tjGetErrorStr());
+        return false;
+    }
+
+    sThread = (OSThread *) memalign(8, sizeof(OSThread));
+    if (sThread == nullptr) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the encoder thread");
+        tjDestroy(sTjHandle);
+        sTjHandle = nullptr;
+        return false;
+    }
+    memset(sThread, 0, sizeof(OSThread));
+
+    sThreadStack = memalign(0x20, THREAD_STACK_SIZE);
+    if (sThreadStack == nullptr) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the encoder stack");
+        free(sThread);
+        sThread = nullptr;
+        tjDestroy(sTjHandle);
+        sTjHandle = nullptr;
+        return false;
+    }
+
+    int core = gEncoderCore;
+    if (core < 0 || core > 2) {
+        core = 2;
+    }
+    const uint8_t affinity = (uint8_t) (1 << core);
+
+    // Priority 25 sits below a typical game thread (~16), so the console stays
+    // playable and the encoder soaks up whatever is left.
+    if (!OSCreateThread(sThread, threadEntry, 0, nullptr,
+                        (char *) sThreadStack + THREAD_STACK_SIZE, THREAD_STACK_SIZE,
+                        25, (OSThreadAttributes) affinity)) {
+        DEBUG_FUNCTION_LINE_ERR("OSCreateThread failed");
+        free(sThreadStack);
+        free(sThread);
+        sThreadStack = nullptr;
+        sThread      = nullptr;
+        tjDestroy(sTjHandle);
+        sTjHandle = nullptr;
+        return false;
+    }
+
+    OSSetThreadName(sThread, "ScreenStreaming encoder");
+    OSResumeThread(sThread);
+    return true;
+}
+
+void Stop() {
+    if (sThread == nullptr) {
+        return;
+    }
+
+    ScreenCapture::SignalStop(); // the sentinel is what ends the loop
+
+    int result = 0;
+    OSJoinThread(sThread, &result);
+
+    free(sThreadStack);
+    free(sThread);
+    sThreadStack = nullptr;
+    sThread      = nullptr;
+
+    // Only safe once the thread is definitely gone.
+    tjDestroy(sTjHandle);
+    sTjHandle = nullptr;
+
+    tjFree(sJpegBuffer);
+    sJpegBuffer   = nullptr;
+    sJpegCapacity = 0;
+
+    free(sScratchRGB);
+    sScratchRGB      = nullptr;
+    sScratchCapacity = 0;
+
+    free(sColStart);
+    free(sColEnd);
+    sColStart    = nullptr;
+    sColEnd      = nullptr;
+    sColCapacity = 0;
+
+    DEBUG_FUNCTION_LINE("Encoder stopped");
+}
+
+bool IsRunning() {
+    // Deliberately reports whether a thread is *owned*, not whether it has
+    // reached its loop yet. Start() tests the same thing, so the two predicates
+    // agree; using sRunning here made a dead-but-not-joined encoder look
+    // stopped to callers and started to Start().
+    return sThread != nullptr;
+}
+
+} // namespace ImageEncoder
