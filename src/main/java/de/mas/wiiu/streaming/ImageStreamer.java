@@ -22,100 +22,183 @@
 
 package de.mas.wiiu.streaming;
 
+import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
-import java.nio.ByteBuffer;
-import java.util.zip.CRC32;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import javax.swing.JOptionPane;
+import javax.swing.SwingUtilities;
 
 import de.mas.wiiu.streaming.gui.IImageProvider;
 import de.mas.wiiu.streaming.gui.ImageProvider;
+import de.mas.wiiu.streaming.network.FrameAssembler;
+import de.mas.wiiu.streaming.network.StreamProtocol;
 import de.mas.wiiu.streaming.network.TCPClient;
 import de.mas.wiiu.streaming.network.UDPClient;
 import de.mas.wiiu.streaming.utilities.Utilities;
-import lombok.Synchronized;
-import lombok.extern.java.Log;
 
-@Log
 public class ImageStreamer {
+    private static final Logger log = Logger.getLogger(ImageStreamer.class.getName());
 
     private final ImageProvider imageProvider = new ImageProvider();
     private final TCPClient tcpClient;
     private final UDPClient udpClient;
+    private final FrameAssembler assembler;
+
+    /**
+     * Decoding runs off the receive thread. A 720p JPEG takes long enough to decode that
+     * doing it inline lets the socket buffer overflow and costs us the tail of the next
+     * frame. Depth 1 with a drop-oldest policy: if we cannot keep up, showing the newest
+     * frame beats building a latency backlog.
+     */
+    private final BlockingQueue<byte[]> decodeQueue = new ArrayBlockingQueue<>(1);
+
+    private long lastFramesCompleted = 0;
+    private long lastBytesReceived = 0;
+    // Incremented on the decoder thread, read-and-cleared on the stats thread, so
+    // it needs the atomic read-modify-write rather than just a visible write.
+    private final AtomicInteger decodedThisSecond = new AtomicInteger();
 
     public ImageStreamer(String ip) throws SocketException {
-        tcpClient = new TCPClient(ip, 8092, 200);
-        udpClient = new UDPClient(9445);
-        new Thread(udpClient, "UDPClient").start();
-        udpClient.setOnDataCallback(this::udpDataHandler);
+        tcpClient = new TCPClient(ip, StreamProtocol.TCP_PORT, 2000);
+        udpClient = new UDPClient(StreamProtocol.UDP_PORT);
+        assembler = new FrameAssembler(this::onFrameAssembled);
 
-        new Thread(() -> {
-            while (true) {
-                if (!tcpClient.isConnected()) {
-                    System.out.print("Connecting..");
-                    try {
-                        tcpClient.connect();
-                        System.out.println("success!");
-                    } catch (IllegalArgumentException | UnknownHostException e1) {
-                        JOptionPane.showMessageDialog(null, "Make sure to enter a valid ip address.", e1.getClass().getName(), JOptionPane.WARNING_MESSAGE);
+        udpClient.setOnDataCallback(assembler::accept);
+        startDaemon("UDPClient", udpClient);
+        startDaemon("Decoder", this::decodeLoop);
+        startDaemon("Heartbeat", this::heartbeatLoop);
+        startDaemon("Stats", this::statsLoop);
+    }
+
+    private static void startDaemon(String name, Runnable body) {
+        final Thread t = new Thread(body, name);
+        // Daemon threads so closing the window actually exits the process.
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void onFrameAssembled(byte[] jpeg) {
+        // Called on the UDP thread - never block it.
+        if (!decodeQueue.offer(jpeg)) {
+            decodeQueue.poll();
+            decodeQueue.offer(jpeg);
+        }
+    }
+
+    private void decodeLoop() {
+        while (true) {
+            final byte[] jpeg;
+            try {
+                jpeg = decodeQueue.take();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            try {
+                final BufferedImage image = Utilities.byteArrayToImage(jpeg);
+                if (image != null) {
+                    decodedThisSecond.incrementAndGet();
+                    imageProvider.updateImage(image);
+                }
+            } catch (RuntimeException | Error e) {
+                // ImageIO's JPEG reader throws unchecked on malformed SOF/SOS data.
+                // Letting that escape would end this thread for good and freeze the
+                // stream with no error anywhere.
+                log.log(Level.WARNING, "Failed to decode a frame", e);
+            }
+        }
+    }
+
+    private void heartbeatLoop() {
+        while (true) {
+            if (!tcpClient.isConnected()) {
+                log.info("Connecting to the Wii U...");
+                try {
+                    tcpClient.connect();
+                    // Now that we know the console's address, refuse video from
+                    // anywhere else.
+                    udpClient.setExpectedSource(tcpClient.getRemoteAddress());
+                    // The console's frame counter restarts whenever the plugin is
+                    // reloaded, so a reconnect needs a fresh view of frame ids.
+                    assembler.requestReset();
+                    log.info("Connected.");
+                } catch (IllegalArgumentException | UnknownHostException e1) {
+                    // Swing dialogs belong on the EDT; this runs on the heartbeat thread.
+                    SwingUtilities.invokeLater(() -> {
+                        JOptionPane.showMessageDialog(null, "Make sure to enter a valid ip address.",
+                                e1.getClass().getName(), JOptionPane.WARNING_MESSAGE);
                         System.exit(-1);
-                    } catch (SocketTimeoutException e) {
-                        System.out.println("time out...");
-                    } catch (IOException e) {
-                        // TODO Auto-generated catch block
-                        e.printStackTrace();
-                    }
-                } else {
-                    sendPing();
+                    });
+                    return;
+                } catch (SocketTimeoutException e) {
+                    log.info("Timed out. Is the plugin running and the console awake?");
+                } catch (IOException e) {
+                    log.info("Connect failed: " + e.getMessage());
                 }
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    // TODO Auto-generated catch block
-                    e.printStackTrace();
-                }
+            } else {
+                sendPing();
             }
-        }).start();
+            sleep(1000);
+        }
+    }
 
-        new Thread(() -> {
-            while (true) {
-                if (tcpClient.isConnected()) {
-                    System.out.println("FPS:" + framesThisSecond);
-                    framesThisSecond = 0;
-                }
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException e) {
-                    // TODO Auto-generated catch block
-                    e.printStackTrace();
-                }
+    private void statsLoop() {
+        while (true) {
+            sleep(1000);
+            if (!tcpClient.isConnected()) {
+                continue;
             }
-        }).start();
+
+            final long completed = assembler.getFramesCompleted();
+            final long bytes = assembler.getBytesReceived();
+            final long framesThisSecond = completed - lastFramesCompleted;
+            final long bytesThisSecond = bytes - lastBytesReceived;
+            lastFramesCompleted = completed;
+            lastBytesReceived = bytes;
+
+            final int decoded = decodedThisSecond.getAndSet(0);
+
+            log.info(String.format("%d fps (%d decoded)  %.2f Mbit/s  incomplete=%d crcfail=%d ignored=%d",
+                    framesThisSecond, decoded, (bytesThisSecond * 8.0) / 1_000_000.0, assembler.getFramesIncomplete(),
+                    assembler.getFramesCrcFailed(), assembler.getDatagramsIgnored()));
+
+            if (framesThisSecond == 0 && assembler.getDatagramsIgnored() > 0 && completed == 0) {
+                log.warning("Connected but no valid frames yet. If the Wii U is running the original "
+                        + "plugin rather than this fork, the wire protocols do not match - see PROTOCOL.md.");
+            }
+        }
+    }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private boolean sendTCP(byte[] rawCommand) {
-        boolean result = false;
         try {
             tcpClient.send(rawCommand);
-            result = true;
+            return true;
         } catch (Exception e) {
-            result = false;
+            return false;
         }
-
-        return result;
     }
 
     void sendPing() {
-        if (sendTCP(new byte[] { 0x15 })) {
-            byte pong;
+        if (sendTCP(new byte[] { StreamProtocol.PING })) {
             try {
-                pong = tcpClient.recvByte();
-                if (pong == 0x16) {
-                    // log.info("Ping...Pong!");
-                } else {
+                final byte pong = tcpClient.recvByte();
+                if (pong != StreamProtocol.PONG) {
                     log.info("Got no valid response to a Ping. Disconnecting.");
                     tcpClient.abort();
                 }
@@ -124,73 +207,12 @@ public class ImageStreamer {
                 tcpClient.abort();
             }
         } else {
-            log.info("Sending the PING failed");
+            log.info("Sending the PING failed. Disconnecting.");
+            tcpClient.abort();
         }
-    }
-
-    private final Object lock = new Object();
-
-    private DataState state = DataState.UNKNOWN;
-    private int curcrc32 = 0;
-    private int curJPEGSize = 0;
-    private byte[] jpegBuffer = {};
-    private int curLenPos = 0;
-
-    private int framesThisSecond = 0;
-
-    @Synchronized("lock")
-    private void udpDataHandler(byte[] data) {
-        if (state == DataState.UNKNOWN) {
-            // System.out.println("GET CRC");
-            if (data.length == 4) {
-                ByteBuffer wrapped = ByteBuffer.wrap(data); // big-endian by default
-                curcrc32 = wrapped.getInt(); // 1
-                state = DataState.CRC32_RECEIVED;
-            } else {
-
-                state = DataState.UNKNOWN;
-                return;
-            }
-        } else if (state == DataState.CRC32_RECEIVED) {
-            // System.out.println("GET Size");
-            if (data.length == 8) {
-                ByteBuffer wrapped = ByteBuffer.wrap(data); // big-endian by default
-                curJPEGSize = (int) wrapped.getLong();
-                jpegBuffer = new byte[curJPEGSize];
-                state = DataState.RECEIVING_IMAGE;
-                curLenPos = 0;
-            } else {
-                // System.out.println("...");
-                state = DataState.UNKNOWN;
-                return;
-            }
-        } else if (state == DataState.RECEIVING_IMAGE) {
-            // System.out.println("GET IMAGE");
-            System.arraycopy(data, 0, jpegBuffer, curLenPos, data.length > curJPEGSize ? curJPEGSize : data.length);
-
-            curJPEGSize -= data.length;
-            curLenPos += data.length;
-            if (curJPEGSize <= 0) {
-                CRC32 crc = new CRC32();
-                crc.update(jpegBuffer);
-                if ((int) crc.getValue() == curcrc32) {
-                    imageProvider.updateImage(Utilities.byteArrayToImage(jpegBuffer));
-                    framesThisSecond++;
-                } else {
-                    System.out.println("Hash mismatch, dropping frame.");
-                }
-                state = DataState.UNKNOWN;
-            }
-        }
-
     }
 
     public IImageProvider getImageProvider() {
         return imageProvider;
     }
-
-    public enum DataState {
-        UNKNOWN, CRC32_RECEIVED, RECEIVING_IMAGE, IMAGE_RECEIVED
-    }
-
 }

@@ -22,25 +22,28 @@
 
 package de.mas.wiiu.streaming.gui;
 
+import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Graphics;
+import java.awt.Graphics2D;
 import java.awt.Image;
+import java.awt.RenderingHints;
 
 import javax.swing.JPanel;
 
 public final class ImagePanel extends JPanel {
-    /**
-     * 
-     */
     private static final long serialVersionUID = -127096088663141229L;
-    private Image image;
-    private final int preferedWidth;
-    private final int preferedHeight;
+
+    /** Written by the decoder thread, read by the EDT. */
+    private volatile Image image;
+
+    private final Dimension preferred;
 
     public ImagePanel(int width, int height) {
         super(true);
-        preferedWidth = width;
-        preferedHeight = height;
+        preferred = new Dimension(width, height);
+        setBackground(Color.BLACK);
+        setOpaque(true);
     }
 
     public void setImage(Image image) {
@@ -48,14 +51,45 @@ public final class ImagePanel extends JPanel {
         repaint();
     }
 
+    @Override
     public Dimension getPreferredSize() {
-        return new Dimension(preferedWidth, preferedHeight);
+        return new Dimension(preferred);
     }
 
-    public void paint(Graphics g) {
-        super.paint(g);
-        if (image != null) {
-            g.drawImage(image, 0, 0, getWidth(), getHeight(), 0, 0, image.getWidth(this), image.getHeight(this), this);
+    @Override
+    protected void paintComponent(Graphics g) {
+        // The upstream version overrode paint() and stretched the frame to fill the
+        // window, which distorts the picture whenever the window is not exactly 16:9.
+        super.paintComponent(g);
+
+        final Image current = image;
+        if (current == null) {
+            return;
+        }
+
+        final int iw = current.getWidth(this);
+        final int ih = current.getHeight(this);
+        if (iw <= 0 || ih <= 0) {
+            return;
+        }
+
+        final int pw = getWidth();
+        final int ph = getHeight();
+
+        // Letterbox: largest centred rectangle with the frame's aspect ratio.
+        final double scale = Math.min(pw / (double) iw, ph / (double) ih);
+        final int dw = Math.max(1, (int) Math.round(iw * scale));
+        final int dh = Math.max(1, (int) Math.round(ih * scale));
+        final int dx = (pw - dw) / 2;
+        final int dy = (ph - dh) / 2;
+
+        final Graphics2D g2 = (Graphics2D) g.create();
+        try {
+            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g2.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_SPEED);
+            g2.drawImage(current, dx, dy, dw, dh, this);
+        } finally {
+            g2.dispose();
         }
     }
 }

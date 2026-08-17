@@ -21,11 +21,11 @@
  *******************************************************************************/
 
 package de.mas.wiiu.streaming.gui;
+
 import java.awt.BorderLayout;
 import java.awt.Dimension;
-import java.awt.Toolkit;
-import java.awt.event.ActionEvent;
-import java.awt.event.ActionListener;
+import java.awt.GraphicsEnvironment;
+import java.awt.Rectangle;
 
 import javax.swing.JFrame;
 import javax.swing.JMenu;
@@ -34,46 +34,58 @@ import javax.swing.JMenuItem;
 import javax.swing.WindowConstants;
 
 public class StreamWindow {
-    private final Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
-    private final ImagePanel image = new ImagePanel(screenSize.width-15, screenSize.height-100);
+    /** The stream tops out at 720p, so that is the natural 1:1 window size. */
+    private static final int NATIVE_WIDTH = 1280;
+    private static final int NATIVE_HEIGHT = 720;
+
+    private final ImagePanel image;
 
     public StreamWindow(IImageProvider imageProvider) {
+        final Dimension size = defaultSize();
+        image = new ImagePanel(size.width, size.height);
 
-        JFrame editorFrame = new JFrame("Wii U Streaming Client");
+        final JFrame frame = new JFrame("Wii U Streaming Client");
+        frame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
 
-        editorFrame.setMaximumSize(screenSize);
-        editorFrame.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        imageProvider.setOnImageChange(image::setImage);
 
-        imageProvider.setOnImageChange((bi) -> image.setImage(bi));
-        editorFrame.getContentPane().add(image);
+        frame.setJMenuBar(buildMenuBar());
+        frame.getContentPane().setLayout(new BorderLayout());
+        frame.getContentPane().add(image, BorderLayout.CENTER);
 
-        JMenuBar menuBar = new JMenuBar();
-        editorFrame.getContentPane().add(menuBar, BorderLayout.NORTH);
-
-        JMenu mnSettings = new JMenu("Settings");
-        menuBar.add(mnSettings);
-
-
-        JMenuItem mntmNewMenuItem = new JMenuItem("Config (Not implemented!)");
-        mntmNewMenuItem.addActionListener(new ActionListener() {
-            public void actionPerformed(ActionEvent e) {
-                //TODO Add program config
-            }
-        });
-        JMenuItem mntmExit = new JMenuItem("Exit");
-        mntmExit.addActionListener(new ActionListener() {
-            public void actionPerformed(ActionEvent e) {
-                System.exit(0);
-            }
-        });
-
-        mntmNewMenuItem.setEnabled(false);
-        mnSettings.add(mntmNewMenuItem);
-        mnSettings.add(mntmExit);
-
-        editorFrame.pack();
-        editorFrame.setLocationRelativeTo(null);
-        editorFrame.setVisible(true);
+        frame.pack();
+        frame.setMinimumSize(new Dimension(320, 180));
+        frame.setLocationRelativeTo(null);
+        frame.setVisible(true);
     }
 
+    /**
+     * 1:1 at 720p when the display has room for it, otherwise the largest 16:9 window that
+     * fits in the usable screen area. Upstream sized the panel to the whole screen minus a
+     * fixed margin, which produced a window taller than the desktop on laptops.
+     */
+    private static Dimension defaultSize() {
+        final Rectangle usable = GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
+        final int maxW = Math.max(320, usable.width - 80);
+        final int maxH = Math.max(180, usable.height - 120);
+
+        final double scale = Math.min(1.0, Math.min(maxW / (double) NATIVE_WIDTH, maxH / (double) NATIVE_HEIGHT));
+        return new Dimension((int) Math.round(NATIVE_WIDTH * scale), (int) Math.round(NATIVE_HEIGHT * scale));
+    }
+
+    private static JMenuBar buildMenuBar() {
+        final JMenuBar menuBar = new JMenuBar();
+        final JMenu mnSettings = new JMenu("Settings");
+        menuBar.add(mnSettings);
+
+        final JMenuItem mntmConfig = new JMenuItem("Config (configure on the console)");
+        mntmConfig.setEnabled(false);
+        mnSettings.add(mntmConfig);
+
+        final JMenuItem mntmExit = new JMenuItem("Exit");
+        mntmExit.addActionListener(e -> System.exit(0));
+        mnSettings.add(mntmExit);
+
+        return menuBar;
+    }
 }

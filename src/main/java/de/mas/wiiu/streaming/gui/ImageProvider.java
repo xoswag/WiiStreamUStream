@@ -27,7 +27,11 @@ import java.util.function.Consumer;
 
 public final class ImageProvider implements IImageProvider {
 
-    private Consumer<Image> onImageChangeFunction = null;
+    // Written on the EDT when the window is built, read on the decoder thread.
+    // Without volatile there is no happens-before edge between the two, so the
+    // decoder can keep seeing null forever: frames arrive, stats look healthy,
+    // window stays black.
+    private volatile Consumer<Image> onImageChangeFunction = null;
 
     public void updateImage(Image image) {
         if (onImageChangeFunction != null) {

@@ -87,6 +87,13 @@ public class Main {
 
             }
 
+            ip = ip.trim();
+            if (ip.isEmpty()) {
+                JOptionPane.showMessageDialog(null, "No IP address given.", "Wii U streaming client",
+                        JOptionPane.WARNING_MESSAGE);
+                System.exit(2);
+            }
+
             try {
                 new Main(ip);
             } catch (BindException e) {

@@ -25,15 +25,15 @@ package de.mas.wiiu.streaming.network;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.util.logging.Logger;
 
-import lombok.Synchronized;
-import lombok.extern.java.Log;
-
-@Log
 final public class TCPClient {
+    private static final Logger log = Logger.getLogger(TCPClient.class.getName());
+
     private final Object lock = new Object();
 
     private Socket sock;
@@ -50,32 +50,67 @@ final public class TCPClient {
         this.timeout = timeout;
     }
 
-    @Synchronized("lock")
     public void connect() throws IOException {
-        sock = new Socket();
-        sock.connect(new InetSocketAddress(ip, port), timeout);
-        in = new DataInputStream(sock.getInputStream());
-        out = new DataOutputStream(sock.getOutputStream());
-    }
+        synchronized (lock) {
+            final Socket s = new Socket();
+            try {
+                s.connect(new InetSocketAddress(ip, port), timeout);
+                // Without a read timeout a Wii U that stops answering (crashed game,
+                // plugin torn down) parks the heartbeat thread in readByte() forever
+                // and the client never notices it is disconnected.
+                s.setSoTimeout(Math.max(timeout, 2000));
+                s.setTcpNoDelay(true);
 
-    @Synchronized("lock")
-    public boolean abort() {
-        try {
-            sock.close();
-        } catch (IOException e) {
-            log.info(e.getMessage()); // TODO: handle
-            return false;
+                in = new DataInputStream(s.getInputStream());
+                out = new DataOutputStream(s.getOutputStream());
+                sock = s;
+            } catch (IOException | RuntimeException e) {
+                // The heartbeat thread retries once a second forever. Leaking the
+                // socket on each failed attempt eventually exhausts the process's
+                // file descriptors.
+                try {
+                    s.close();
+                } catch (IOException ignored) {
+                    // nothing useful to do
+                }
+                throw e;
+            }
         }
-        return true;
     }
 
-    @Synchronized("lock")
+    /** The console's address, or null while disconnected. */
+    public InetAddress getRemoteAddress() {
+        synchronized (lock) {
+            return sock != null ? sock.getInetAddress() : null;
+        }
+    }
+
+    public boolean abort() {
+        synchronized (lock) {
+            final Socket s = sock;
+            sock = null;
+            in = null;
+            out = null;
+            if (s == null) {
+                return true;
+            }
+            try {
+                s.close();
+            } catch (IOException e) {
+                log.info("Failed to close socket: " + e.getMessage());
+                return false;
+            }
+            return true;
+        }
+    }
+
     public void send(byte[] rawCommand) throws IOException {
-        try {
+        synchronized (lock) {
+            if (out == null) {
+                throw new IOException("not connected");
+            }
             out.write(rawCommand);
             out.flush();
-        } catch (IOException e) {
-            throw e;
         }
     }
 
@@ -84,36 +119,39 @@ final public class TCPClient {
     }
 
     public void send(byte _byte) throws IOException {
-        send(ByteBuffer.allocate(1).put(_byte).array());
+        send(new byte[] { _byte });
     }
 
-    @Synchronized("lock")
     public byte recvByte() throws IOException {
-        return in.readByte();
+        synchronized (lock) {
+            if (in == null) {
+                throw new IOException("not connected");
+            }
+            return in.readByte();
+        }
     }
 
-    @Synchronized("lock")
     short recvShort() throws IOException {
-        try {
+        synchronized (lock) {
+            if (in == null) {
+                throw new IOException("not connected");
+            }
             return in.readShort();
-        } catch (IOException e) {
-            log.info(e.getMessage());
-            throw e;
         }
     }
 
-    @Synchronized("lock")
     int recvInt() throws IOException {
-        try {
+        synchronized (lock) {
+            if (in == null) {
+                throw new IOException("not connected");
+            }
             return in.readInt();
-        } catch (IOException e) {
-            log.info(e.getMessage());
-            throw e;
         }
     }
 
-    @Synchronized("lock")
     public boolean isConnected() {
-        return (sock != null && sock.isConnected() && !sock.isClosed());
+        synchronized (lock) {
+            return (sock != null && sock.isConnected() && !sock.isClosed());
+        }
     }
 }
