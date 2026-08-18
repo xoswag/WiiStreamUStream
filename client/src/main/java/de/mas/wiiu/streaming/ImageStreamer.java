@@ -66,6 +66,15 @@ public class ImageStreamer {
     // it needs the atomic read-modify-write rather than just a visible write.
     private final AtomicInteger decodedThisSecond = new AtomicInteger();
 
+    /**
+     * A single late PONG used to disconnect immediately, which tore down the whole
+     * video stream. The console answers late whenever it is busy encoding a big
+     * frame, so tolerate a few misses in a row and only give up when the console
+     * has really gone quiet.
+     */
+    private static final int MAX_MISSED_PINGS = 3;
+    private int missedPings = 0;
+
     public ImageStreamer(String ip) throws SocketException {
         tcpClient = new TCPClient(ip, StreamProtocol.TCP_PORT, 2000);
         udpClient = new UDPClient(StreamProtocol.UDP_PORT);
@@ -129,6 +138,7 @@ public class ImageStreamer {
                     // The console's frame counter restarts whenever the plugin is
                     // reloaded, so a reconnect needs a fresh view of frame ids.
                     assembler.requestReset();
+                    missedPings = 0;
                     log.info("Connected.");
                 } catch (IllegalArgumentException | UnknownHostException e1) {
                     // Swing dialogs belong on the EDT; this runs on the heartbeat thread.
@@ -195,20 +205,37 @@ public class ImageStreamer {
     }
 
     void sendPing() {
-        if (sendTCP(new byte[] { StreamProtocol.PING })) {
-            try {
-                final byte pong = tcpClient.recvByte();
-                if (pong != StreamProtocol.PONG) {
-                    log.info("Got no valid response to a Ping. Disconnecting.");
-                    tcpClient.abort();
-                }
-            } catch (IOException e) {
-                log.info("Failed to get PONG. Disconnecting.");
-                tcpClient.abort();
-            }
-        } else {
+        if (!sendTCP(new byte[] { StreamProtocol.PING })) {
+            // The socket itself is broken - no point tolerating that.
             log.info("Sending the PING failed. Disconnecting.");
             tcpClient.abort();
+            return;
+        }
+
+        try {
+            final byte pong = tcpClient.recvByte();
+            if (pong == StreamProtocol.PONG) {
+                missedPings = 0;
+                return;
+            }
+            onMissedPong("got a non-PONG byte (0x" + Integer.toHexString(pong & 0xFF) + ")");
+        } catch (SocketTimeoutException e) {
+            // The usual case: the console is mid-encode and answered late. Keep the
+            // video flowing and try again next second.
+            onMissedPong("timed out waiting for PONG");
+        } catch (IOException e) {
+            // A real I/O error on the control socket is not just slowness.
+            log.info("Control socket error, disconnecting: " + e.getMessage());
+            tcpClient.abort();
+        }
+    }
+
+    private void onMissedPong(String why) {
+        missedPings++;
+        if (missedPings >= MAX_MISSED_PINGS) {
+            log.info("No PONG after " + missedPings + " tries (" + why + "). Disconnecting.");
+            tcpClient.abort();
+            missedPings = 0;
         }
     }
 

@@ -35,6 +35,15 @@ namespace {
 
 constexpr uint32_t THREAD_STACK_SIZE = 0x8000;
 
+/**
+ * Above the encoder's priority (25) so a ping is always answered promptly,
+ * even while the encoder is mid-frame on this same core. The heartbeat runs
+ * for only a few microseconds a second, so out-prioritising the encoder costs
+ * nothing - and answering late was making the client time out and tear the
+ * whole stream down, which is the multi-second freeze/reconnect loop.
+ */
+constexpr int32_t CONTROL_THREAD_PRIORITY = 18;
+
 /** A client that has not pinged in this long is treated as gone. */
 constexpr int CLIENT_TIMEOUT_MS = 5000;
 
@@ -226,7 +235,7 @@ bool Start() {
 
     if (!OSCreateThread(sThread, threadEntry, 0, nullptr,
                         (char *) sThreadStack + THREAD_STACK_SIZE, THREAD_STACK_SIZE,
-                        25, OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
+                        CONTROL_THREAD_PRIORITY, OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
         DEBUG_FUNCTION_LINE_ERR("Failed to create the control server thread");
         free(sThreadStack);
         free(sThread);
