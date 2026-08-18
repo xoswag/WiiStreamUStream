@@ -26,14 +26,14 @@
 #include <coreinit/cache.h>
 #include <wups.h>
 
-WUPS_PLUGIN_NAME("Screen Streaming");
+WUPS_PLUGIN_NAME("WiiStreamUStream");
 WUPS_PLUGIN_DESCRIPTION("Streams the TV or GamePad screen to a PC over the network. "
-                        "Run the StreamingPluginClient on your computer and enter this console's IP.");
+                        "Run the WiiStreamUStream client on your computer and enter this console's IP.");
 WUPS_PLUGIN_VERSION("v0.2");
 WUPS_PLUGIN_AUTHOR("Maschell");
 WUPS_PLUGIN_LICENSE("GPL");
 
-WUPS_USE_STORAGE("screenstreaming");
+WUPS_USE_STORAGE("wiistreamustream");
 
 namespace {
 

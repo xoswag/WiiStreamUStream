@@ -1,12 +1,12 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
-	<groupId>StreamingPluginClient</groupId>
-	<artifactId>StreamingPluginClient</artifactId>
+	<groupId>com.github.xoswag</groupId>
+	<artifactId>wiistreamustream-client</artifactId>
 	<version>0.2.0</version>
 
-	<name>StreamingPluginClient</name>
-	<url>https://github.com/Maschell/StreamingPluginClient</url>
+	<name>WiiStreamUStream Client</name>
+	<url>https://github.com/xoswag/WiiStreamUStream</url>
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -68,7 +68,7 @@
 							     appendAssemblyId=false and finalName equal to
 							     ${artifactId}-${version}, the fat jar silently
 							     overwrites the thin jar Maven just produced. -->
-							<finalName>StreamingPluginClient-${project.version}-app</finalName>
+							<finalName>WiiStreamUStream-Client-${project.version}-app</finalName>
 							<appendAssemblyId>false</appendAssemblyId>
 						</configuration>
 						<phase>package</phase>

@@ -22,7 +22,7 @@ to the modern plugin system, fixes the capture path, and replaces the wire proto
 - The **matching client from this fork** — the wire protocol changed, see [PROTOCOL.md](PROTOCOL.md).
   The upstream client will show a black window.
 
-Copy `screenstreaming.wps` to:
+Copy `wiistreamustream.wps` to:
 
 ```
 sd:/wiiu/environments/aroma/plugins/
@@ -94,7 +94,7 @@ latency and smoothness. This fork is for capturing the *TV* output at *720p*, wh
 ## What changed from upstream
 
 **Ported to the current plugin system**
-- WUPS 0.9 / Aroma. Output is `screenstreaming.wps`, not `.mod`.
+- WUPS 0.9 / Aroma. Output is `wiistreamustream.wps`, not `.mod`.
 - `WUPS_GET_CONFIG` is a hard `static_assert` in modern WUPS; the menu is rebuilt on `WUPSConfigAPI`,
   with settings persisted through `WUPSStorageAPI`.
 - `ON_APP_STATUS_CHANGED` no longer exists; foreground tracking moved to
@@ -151,17 +151,17 @@ latency and smoothness. This fork is for capturing the *TV* output at *720p*, wh
 With Docker (nothing else needed on your machine):
 
 ```bash
-docker build . -t screenstreaming-builder
+docker build . -t wiistreamustream-builder
 ```
 
 ```bash
-docker run -it --rm -v ${PWD}:/project screenstreaming-builder make
+docker run -it --rm -v ${PWD}:/project wiistreamustream-builder make
 ```
 
 For the debug build with live logging over UDP (use `wiiulogserver` or the Aroma logging module):
 
 ```bash
-docker run -it --rm -v ${PWD}:/project screenstreaming-builder make DEBUG=1
+docker run -it --rm -v ${PWD}:/project wiistreamustream-builder make DEBUG=1
 ```
 
 Without Docker you need devkitPPC, [wut](https://github.com/devkitPro/wut),

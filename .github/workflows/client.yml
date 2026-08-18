@@ -1,0 +1,43 @@
+name: client
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "client/**"
+      - ".github/workflows/client.yml"
+  pull_request:
+    paths:
+      - "client/**"
+      - ".github/workflows/client.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: client
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          # The pom is not at the repo root in this layout, so the cache action
+          # has to be pointed at it explicitly.
+          cache-dependency-path: client/pom.xml
+
+      - name: Build
+        run: mvn -B -ntp package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # upload-artifact paths are workspace-relative; defaults.run.working-directory
+          # only applies to `run` steps.
+          name: WiiStreamUStream-Client
+          path: client/target/WiiStreamUStream-Client-*-app.jar
+          if-no-files-found: error
