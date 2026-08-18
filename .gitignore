@@ -1,0 +1,5 @@
+# The two upstream clones this repository was assembled from. They are kept
+# around only until CI is green; their history lives on under plugin/ and
+# client/ via git subtree.
+/StreamingPluginWiiU/
+/StreamingPluginClient/
