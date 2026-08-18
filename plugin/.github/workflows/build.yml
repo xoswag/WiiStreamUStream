@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the builder image
+        run: docker build . -t screenstreaming-builder
+
+      - name: make
+        run: docker run --rm -v ${PWD}:/project screenstreaming-builder make
+
+      - name: Check the plugin was produced
+        run: test -f screenstreaming.wps
+
+      - name: Package
+        run: |
+          mkdir -p wiiu/environments/aroma/plugins
+          cp screenstreaming.wps wiiu/environments/aroma/plugins/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenstreaming
+          path: wiiu
+          if-no-files-found: error
+
+  build-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the builder image
+        run: docker build . -t screenstreaming-builder
+
+      # DEBUG=1 turns on the WHBLog output, which is how you see the per-second
+      # capture/encode/drop counters over UDP while the stream is running.
+      - name: make DEBUG=1
+        run: docker run --rm -v ${PWD}:/project screenstreaming-builder make DEBUG=1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: screenstreaming-debug
+          path: screenstreaming.wps
+          if-no-files-found: error
