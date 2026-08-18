@@ -56,6 +56,7 @@ bool sInitialised = false;
 // Written on the game's render thread, read and reset on the encoder thread.
 // Touched with __atomic builtins: volatile would neither make the read-modify-write
 // atomic nor keep -Wall quiet about incrementing a volatile.
+uint32_t sPresented = 0;
 uint32_t sCaptured = 0;
 uint32_t sSkipped = 0;
 uint32_t sFrameSkipCounter = 0;
@@ -220,6 +221,10 @@ bool ScreenCapture::CaptureFrame(const GX2ColorBuffer *srcBuffer, GX2ScanTarget 
         return false;
     }
 
+    // Count the present before any gate: this is the ceiling the encoder is
+    // measured against.
+    __atomic_add_fetch(&sPresented, 1, __ATOMIC_RELAXED);
+
     // Cheap rejections first. Upstream did the 3.6 MB copy and a full GPU
     // pipeline stall *before* asking whether anyone could take the frame, so it
     // paid the entire cost of every frame it then threw away.
@@ -319,6 +324,10 @@ void ScreenCapture::SignalStop() {
     OSSendMessage(&sReadyQueue, &msg, OS_MESSAGE_FLAGS_HIGH_PRIORITY);
 }
 
+uint32_t ScreenCapture::GetPresentedCount() {
+    return __atomic_load_n(&sPresented, __ATOMIC_RELAXED);
+}
+
 uint32_t ScreenCapture::GetCapturedCount() {
     return __atomic_load_n(&sCaptured, __ATOMIC_RELAXED);
 }
@@ -328,6 +337,7 @@ uint32_t ScreenCapture::GetSkippedCount() {
 }
 
 void ScreenCapture::ResetCounters() {
+    __atomic_store_n(&sPresented, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&sCaptured, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&sSkipped, 0, __ATOMIC_RELAXED);
 }

@@ -72,7 +72,22 @@ public:
     /** Wakes WaitForFrame() so the encoder thread can exit. */
     static void SignalStop();
 
+    /**
+     * How many times the selected screen was presented while streaming - i.e. the
+     * game's actual present rate, counted before frame-skip or slot availability
+     * gate anything out. This is the true "max capture FPS" ceiling.
+     *
+     * Note it assumes the title issues one scan-buffer copy per flip for the
+     * selected target, which is the normal case; a title that copies twice would
+     * read as double the real present rate.
+     */
+    static uint32_t GetPresentedCount();
     static uint32_t GetCapturedCount();
+    /**
+     * Frames the encoder could not accept because it had no free slot (it was still
+     * busy on the previous frame). This - not present minus captured, which also
+     * counts deliberate frame-skip - is the CPU-encode-bottleneck signal.
+     */
     static uint32_t GetSkippedCount();
     static void ResetCounters();
 };

@@ -42,10 +42,13 @@ constexpr int JPEG_SUBSAMPLING = TJSAMP_420;
 OSThread *sThread = nullptr;
 void *sThreadStack = nullptr;
 
-// Wall-clock spent in the CPU stages of a frame (cache invalidate + resample +
-// JPEG compress), summed since the last report tick. Divided by the frame count
-// to get average "compression time" for the on-console diagnostics.
+// Wall-clock spent in the CPU stages of a frame, summed since the last report
+// tick and divided by the frame count for the on-console diagnostics. sEncodeUs
+// is the whole path (cache invalidate + resample + JPEG); sCompressUs is just the
+// tjCompress2 call, so the two together say how much of the cost is the JPEG DCT
+// itself versus the surrounding memory work.
 uint64_t sEncodeUs = 0;
+uint64_t sCompressUs = 0;
 uint32_t sEncodeCount = 0;
 
 tjhandle sTjHandle = nullptr;
@@ -327,6 +330,7 @@ void encodeAndSend(CaptureSlot *slot) {
     // TJFLAG_NOREALLOC keeps turbojpeg from allocating per frame; TJFLAG_FASTDCT
     // is worth a lot here because the Espresso has no AltiVec, so libjpeg-turbo
     // runs its plain-C path and the DCT dominates.
+    const OSTime compressStart = OSGetSystemTime();
     const int rc = tjCompress2(sTjHandle, encodeSrc, (int) dstW, encodePitch, (int) dstH,
                                encodePixelFormat, &jpegBuf, &jpegSize,
                                JPEG_SUBSAMPLING, quality,
@@ -336,7 +340,9 @@ void encodeAndSend(CaptureSlot *slot) {
         return;
     }
 
-    sEncodeUs += OSTicksToMicroseconds(OSGetSystemTime() - encodeStart);
+    const OSTime doneTime = OSGetSystemTime();
+    sCompressUs += OSTicksToMicroseconds(doneTime - compressStart);
+    sEncodeUs += OSTicksToMicroseconds(doneTime - encodeStart);
     sEncodeCount++;
 
     const StreamSender::FrameMeta meta = {
@@ -353,12 +359,13 @@ int threadEntry(int /*argc*/, const char ** /*argv*/) {
     DEBUG_FUNCTION_LINE("Encoder thread running");
 
     OSTime lastReport = OSGetTime();
-    uint32_t encoded  = 0;
-    uint32_t lastFramesSent = StreamSender::GetFramesSent();
-    uint64_t lastBytesSent  = StreamSender::GetBytesSent();
-    (void) encoded;        // only read by the DEBUG-only log below
-    (void) lastFramesSent; // ditto
+    uint32_t lastFramesSent   = StreamSender::GetFramesSent();
+    uint64_t lastBytesSent    = StreamSender::GetBytesSent();
+    uint64_t lastWireBytesSent = StreamSender::GetWireBytesSent();
+    bool windowAnchored = false;
+    (void) lastFramesSent; // only read by the DEBUG-only log below
     (void) lastBytesSent;
+    (void) lastWireBytesSent;
 
     // The stop sentinel is the *only* exit. Checking sShouldExit here as well
     // would let a thread that was mid-encode when Stop() was called leave the
@@ -371,40 +378,88 @@ int threadEntry(int /*argc*/, const char ** /*argv*/) {
             break;
         }
 
+        if (!windowAnchored) {
+            // Anchor the very first measurement window to the first frame of the
+            // stream. The encoder thread is created at title launch but frames only
+            // flow once a client connects, seconds-to-minutes later; without this the
+            // first report would divide a whole window of idle time by a handful of
+            // frames and read near-zero. It also discards any counts left over from a
+            // previous run of this thread (an "Encoder core" change stops and restarts
+            // it), so the first report is never a blend of two sessions.
+            windowAnchored = true;
+            ScreenCapture::ResetCounters();
+            sEncodeUs         = 0;
+            sCompressUs       = 0;
+            sEncodeCount      = 0;
+            lastFramesSent    = StreamSender::GetFramesSent();
+            lastBytesSent     = StreamSender::GetBytesSent();
+            lastWireBytesSent = StreamSender::GetWireBytesSent();
+            lastReport        = OSGetTime();
+        }
+
         encodeAndSend(slot);
         ScreenCapture::ReleaseFrame(slot);
-        encoded++;
 
         const OSTime now = OSGetTime();
-        const uint32_t elapsedS = (uint32_t) OSTicksToSeconds(now - lastReport);
-        if (elapsedS >= 5) {
+        // Millisecond window, not floored whole seconds: dividing counts by an
+        // integer 5 when the window actually ran 5.4 s inflates every rate, and the
+        // inflation is worst exactly when frames are sparse (720p) - the regime the
+        // measurement is meant to characterise.
+        const uint32_t elapsedMs = (uint32_t) OSTicksToMilliseconds(now - lastReport);
+        if (elapsedMs >= 5000) {
+            // Snapshot every counter once, so the two log lines below are consistent
+            // with each other and the divisions cannot see a mid-update value.
+            const uint32_t presented  = ScreenCapture::GetPresentedCount();
+            const uint32_t captured   = ScreenCapture::GetCapturedCount();
+            const uint32_t encBusy    = ScreenCapture::GetSkippedCount();
+            const uint32_t encodeCnt  = sEncodeCount;
             const uint32_t framesSent = StreamSender::GetFramesSent() - lastFramesSent;
             const uint64_t bytesSent  = StreamSender::GetBytesSent() - lastBytesSent;
-            const uint32_t avgEncodeUs = sEncodeCount ? (uint32_t) (sEncodeUs / sEncodeCount) : 0;
-            const uint32_t avgBytes    = framesSent ? (uint32_t) (bytesSent / framesSent) : 0;
-            // Bits/second on the wire this window, so the console log alone shows
-            // whether the encoder or the link is the limit.
-            const uint32_t mbitx100 = elapsedS ? (uint32_t) ((bytesSent * 8ull) / (elapsedS * 10000ull)) : 0;
+            const uint64_t wireSent   = StreamSender::GetWireBytesSent() - lastWireBytesSent;
 
-            // Only read by the DEBUG_FUNCTION_LINE below, which compiles to while(0)
-            // in a release build - void them so that build stays warning-clean.
+            const uint32_t avgEncodeUs = encodeCnt ? (uint32_t) (sEncodeUs / encodeCnt) : 0;
+            const uint32_t avgJpegUs   = encodeCnt ? (uint32_t) (sCompressUs / encodeCnt) : 0;
+            const uint32_t avgBytes    = framesSent ? (uint32_t) (bytesSent / framesSent) : 0;
+
+            // Rates over the real window. present is the ceiling (game present rate);
+            // encBusy is the honest "encoder could not take the frame, no free slot"
+            // count - the CPU-bottleneck signal. present - capture is NOT that signal,
+            // because frame-skip drops frames on purpose before the slot check.
+            const uint32_t presentFps = (uint32_t) ((uint64_t) presented * 1000 / elapsedMs);
+            const uint32_t captureFps = (uint32_t) ((uint64_t) captured * 1000 / elapsedMs);
+            const uint32_t encodeFps  = (uint32_t) ((uint64_t) encodeCnt * 1000 / elapsedMs);
+            const uint32_t txFps      = (uint32_t) ((uint64_t) framesSent * 1000 / elapsedMs);
+            const uint32_t encBusyPerS = (uint32_t) ((uint64_t) encBusy * 1000 / elapsedMs);
+            // Application-layer throughput (payload + 44-byte header); true link use
+            // is ~5-8% higher once UDP/IP/Ethernet framing is added.
+            const uint32_t mbitx100   = (uint32_t) ((wireSent * 800ull) / (elapsedMs * 1000ull));
+
+            // Only read by the DEBUG_FUNCTION_LINE calls below, which compile to
+            // while(0) in a release build - void them so that build stays warning-clean.
             (void) avgEncodeUs;
+            (void) avgJpegUs;
             (void) avgBytes;
             (void) mbitx100;
+            (void) presentFps;
+            (void) captureFps;
+            (void) encodeFps;
+            (void) txFps;
+            (void) encBusyPerS;
 
-            DEBUG_FUNCTION_LINE("capture %u fps | encode %u fps (%u.%02u ms) | tx %u fps %u.%02u Mbit/s | "
-                                "avg %u KB | dropped %u | sendfail %u",
-                                ScreenCapture::GetCapturedCount() / elapsedS,
-                                encoded / elapsedS, avgEncodeUs / 1000, (avgEncodeUs % 1000) / 10,
-                                framesSent / elapsedS, mbitx100 / 100, mbitx100 % 100,
-                                avgBytes / 1024,
-                                ScreenCapture::GetSkippedCount(), StreamSender::GetSendFailures());
+            DEBUG_FUNCTION_LINE("[fps] present %u | capture %u | encode %u | tx %u   (enc-busy %u/s, sendfail %u total)",
+                                presentFps, captureFps, encodeFps, txFps, encBusyPerS,
+                                StreamSender::GetSendFailures());
+            DEBUG_FUNCTION_LINE("[cost] encode %u.%02u ms (jpeg %u.%02u ms) | %u.%02u Mbit/s | avg %u KB/frame",
+                                avgEncodeUs / 1000, (avgEncodeUs % 1000) / 10,
+                                avgJpegUs / 1000, (avgJpegUs % 1000) / 10,
+                                mbitx100 / 100, mbitx100 % 100, avgBytes / 1024);
 
-            encoded       = 0;
             sEncodeUs     = 0;
+            sCompressUs   = 0;
             sEncodeCount  = 0;
-            lastFramesSent = StreamSender::GetFramesSent();
-            lastBytesSent  = StreamSender::GetBytesSent();
+            lastFramesSent    = StreamSender::GetFramesSent();
+            lastBytesSent     = StreamSender::GetBytesSent();
+            lastWireBytesSent = StreamSender::GetWireBytesSent();
             lastReport    = now;
             ScreenCapture::ResetCounters();
         }

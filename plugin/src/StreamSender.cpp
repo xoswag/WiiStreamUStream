@@ -38,7 +38,8 @@ int sSocket = -1;
 uint32_t sFrameId = 0;
 uint32_t sSendFailures = 0;
 uint32_t sFramesSent = 0;
-uint64_t sBytesSent = 0;
+uint64_t sBytesSent = 0;     // frame payload only
+uint64_t sWireBytesSent = 0; // payload + headers actually put on the socket
 crc32_t sCrc;
 
 uint8_t sPacket[STREAM_HEADER_SIZE + STREAM_MAX_PAYLOAD];
@@ -198,6 +199,9 @@ bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta) {
             ok = false;
             break;
         }
+        // Count only datagrams that actually reached the socket, so the bandwidth
+        // figure reflects the wire and not what we intended to send.
+        sWireBytesSent += STREAM_HEADER_SIZE + chunkLen;
 
         offset += chunkLen;
     }
@@ -228,6 +232,13 @@ uint64_t GetBytesSent() {
     // print a nonsense Mbit/s figure in the diagnostics.
     OSFastMutex_Lock(&sMutex);
     const uint64_t v = sBytesSent;
+    OSFastMutex_Unlock(&sMutex);
+    return v;
+}
+
+uint64_t GetWireBytesSent() {
+    OSFastMutex_Lock(&sMutex);
+    const uint64_t v = sWireBytesSent;
     OSFastMutex_Unlock(&sMutex);
     return v;
 }

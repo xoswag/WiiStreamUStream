@@ -64,6 +64,7 @@ uint32_t GetSendFailures();
 
 // --- Instrumentation. Monotonic counters, read on the encoder's report tick. --
 uint32_t GetFramesSent();
-uint64_t GetBytesSent();
+uint64_t GetBytesSent();     // frame payload bytes only (for average KB/frame)
+uint64_t GetWireBytesSent(); // payload + 44-byte headers (for link bandwidth)
 
 } // namespace StreamSender
