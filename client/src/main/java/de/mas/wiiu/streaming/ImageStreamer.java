@@ -30,6 +30,7 @@ import java.net.UnknownHostException;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -38,6 +39,7 @@ import javax.swing.SwingUtilities;
 
 import de.mas.wiiu.streaming.gui.IImageProvider;
 import de.mas.wiiu.streaming.gui.ImageProvider;
+import de.mas.wiiu.streaming.network.Frame;
 import de.mas.wiiu.streaming.network.FrameAssembler;
 import de.mas.wiiu.streaming.network.StreamProtocol;
 import de.mas.wiiu.streaming.network.TCPClient;
@@ -58,13 +60,18 @@ public class ImageStreamer {
      * frame. Depth 1 with a drop-oldest policy: if we cannot keep up, showing the newest
      * frame beats building a latency backlog.
      */
-    private final BlockingQueue<byte[]> decodeQueue = new ArrayBlockingQueue<>(1);
+    private final BlockingQueue<Frame> decodeQueue = new ArrayBlockingQueue<>(1);
 
     private long lastFramesCompleted = 0;
     private long lastBytesReceived = 0;
     // Incremented on the decoder thread, read-and-cleared on the stats thread, so
     // it needs the atomic read-modify-write rather than just a visible write.
     private final AtomicInteger decodedThisSecond = new AtomicInteger();
+    private final AtomicLong decodeNanosThisSecond = new AtomicLong();
+    // Frames that reached the decode queue but were evicted by a newer one because
+    // the decoder could not keep up. This is the "we are dropping to stay live"
+    // number and was invisible before.
+    private final AtomicLong backlogDrops = new AtomicLong();
 
     /**
      * A single late PONG used to disconnect immediately, which tore down the whole
@@ -94,26 +101,32 @@ public class ImageStreamer {
         t.start();
     }
 
-    private void onFrameAssembled(byte[] jpeg) {
-        // Called on the UDP thread - never block it.
-        if (!decodeQueue.offer(jpeg)) {
-            decodeQueue.poll();
-            decodeQueue.offer(jpeg);
+    private void onFrameAssembled(Frame frame) {
+        // Called on the UDP thread - never block it. Latest-frame-wins: if the
+        // decoder is behind, throw away the frame it has not started yet and keep
+        // the newest, so latency never accumulates.
+        if (!decodeQueue.offer(frame)) {
+            if (decodeQueue.poll() != null) {
+                backlogDrops.incrementAndGet();
+            }
+            decodeQueue.offer(frame);
         }
     }
 
     private void decodeLoop() {
         while (true) {
-            final byte[] jpeg;
+            final Frame frame;
             try {
-                jpeg = decodeQueue.take();
+                frame = decodeQueue.take();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             }
             try {
-                final BufferedImage image = Utilities.byteArrayToImage(jpeg);
+                final long t0 = System.nanoTime();
+                final BufferedImage image = decode(frame);
                 if (image != null) {
+                    decodeNanosThisSecond.addAndGet(System.nanoTime() - t0);
                     decodedThisSecond.incrementAndGet();
                     imageProvider.updateImage(image);
                 }
@@ -123,6 +136,60 @@ public class ImageStreamer {
                 // stream with no error anywhere.
                 log.log(Level.WARNING, "Failed to decode a frame", e);
             }
+        }
+    }
+
+    /** Turns a received frame into an image based on what its header declares it to be. */
+    private BufferedImage decode(Frame frame) {
+        switch (frame.compressionType) {
+            case StreamProtocol.COMP_JPEG:
+                return Utilities.byteArrayToImage(frame.payload);
+            case StreamProtocol.COMP_RAW:
+                return decodeRaw(frame);
+            default:
+                logOncePerSecond("Unsupported compression type " + frame.compressionType
+                        + " - client is older than the plugin.");
+                return null;
+        }
+    }
+
+    /** Unpacks a tightly-strided RGB888 / RGBA8888 frame into a BufferedImage. */
+    private static BufferedImage decodeRaw(Frame frame) {
+        final int bpp = StreamProtocol.bytesPerPixel(frame.pixelFormat);
+        // FrameAssembler already validates COMP_RAW geometry, but decodeRaw indexes
+        // the payload directly, so re-check here rather than trust the caller: a
+        // bad stride/height would be an out-of-bounds read.
+        if (bpp == 0 || frame.width <= 0 || frame.height <= 0 || frame.stride < frame.width * bpp
+                || (long) frame.height * frame.stride > frame.payload.length) {
+            return null;
+        }
+        final int w = frame.width;
+        final int h = frame.height;
+        final int stride = frame.stride;
+        final byte[] src = frame.payload;
+        final int[] argb = new int[w * h];
+        for (int y = 0; y < h; y++) {
+            int si = y * stride;
+            int di = y * w;
+            for (int x = 0; x < w; x++, si += bpp) {
+                final int r = src[si] & 0xFF;
+                final int g = src[si + 1] & 0xFF;
+                final int b = src[si + 2] & 0xFF;
+                argb[di + x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+        }
+        final BufferedImage image = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+        image.setRGB(0, 0, w, h, argb, 0, w);
+        return image;
+    }
+
+    private long lastUnsupportedLog = 0;
+
+    private void logOncePerSecond(String message) {
+        final long now = System.nanoTime();
+        if (now - lastUnsupportedLog > 1_000_000_000L) {
+            lastUnsupportedLog = now;
+            log.warning(message);
         }
     }
 
@@ -175,10 +242,15 @@ public class ImageStreamer {
             lastBytesReceived = bytes;
 
             final int decoded = decodedThisSecond.getAndSet(0);
+            final long decodeNanos = decodeNanosThisSecond.getAndSet(0);
+            final double avgDecodeMs = decoded > 0 ? (decodeNanos / (double) decoded) / 1_000_000.0 : 0.0;
 
-            log.info(String.format("%d fps (%d decoded)  %.2f Mbit/s  incomplete=%d crcfail=%d ignored=%d",
-                    framesThisSecond, decoded, (bytesThisSecond * 8.0) / 1_000_000.0, assembler.getFramesIncomplete(),
-                    assembler.getFramesCrcFailed(), assembler.getDatagramsIgnored()));
+            log.info(String.format(
+                    "recv %d fps | disp %d fps (decode %.1f ms) | %.2f Mbit/s | incomplete=%d crcfail=%d "
+                            + "ignored=%d backlogdrop=%d wrongsrc=%d",
+                    framesThisSecond, decoded, avgDecodeMs, (bytesThisSecond * 8.0) / 1_000_000.0,
+                    assembler.getFramesIncomplete(), assembler.getFramesCrcFailed(), assembler.getDatagramsIgnored(),
+                    backlogDrops.get(), udpClient.getWrongSourceDiscards()));
 
             if (framesThisSecond == 0 && assembler.getDatagramsIgnored() > 0 && completed == 0) {
                 log.warning("Connected but no valid frames yet. If the Wii U is running the original "

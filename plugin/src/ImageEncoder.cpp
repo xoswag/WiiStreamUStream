@@ -13,6 +13,7 @@
  ****************************************************************************/
 #include "ImageEncoder.hpp"
 #include "ScreenCapture.hpp"
+#include "StreamProtocol.h"
 #include "StreamSender.hpp"
 #include "retain_vars.hpp"
 #include "utils/logger.h"
@@ -40,6 +41,12 @@ constexpr int JPEG_SUBSAMPLING = TJSAMP_420;
 
 OSThread *sThread = nullptr;
 void *sThreadStack = nullptr;
+
+// Wall-clock spent in the CPU stages of a frame (cache invalidate + resample +
+// JPEG compress), summed since the last report tick. Divided by the frame count
+// to get average "compression time" for the on-console diagnostics.
+uint64_t sEncodeUs = 0;
+uint32_t sEncodeCount = 0;
 
 tjhandle sTjHandle = nullptr;
 
@@ -266,6 +273,10 @@ void encodeAndSend(CaptureSlot *slot) {
         return;
     }
 
+    // Time the whole CPU cost of the frame (cache invalidate + resample + JPEG
+    // compress) for the diagnostics. The network send is deliberately excluded.
+    const OSTime encodeStart = OSGetSystemTime();
+
     // Invalidate on the core that is about to read. dcbi only affects the cache
     // of the core executing it, so doing this in the GX2 hook (which runs on the
     // game's render thread, on a different core) would not help this thread at
@@ -325,7 +336,17 @@ void encodeAndSend(CaptureSlot *slot) {
         return;
     }
 
-    StreamSender::SendFrame(sJpegBuffer, (uint32_t) jpegSize);
+    sEncodeUs += OSTicksToMicroseconds(OSGetSystemTime() - encodeStart);
+    sEncodeCount++;
+
+    const StreamSender::FrameMeta meta = {
+            .width           = (uint16_t) dstW,
+            .height          = (uint16_t) dstH,
+            .stride          = 0, // JPEG carries its own dimensions
+            .compressionType = STREAM_COMP_JPEG,
+            .pixelFormat     = STREAM_PIXFMT_JPEG,
+    };
+    StreamSender::SendFrame(sJpegBuffer, (uint32_t) jpegSize, meta);
 }
 
 int threadEntry(int /*argc*/, const char ** /*argv*/) {
@@ -333,7 +354,11 @@ int threadEntry(int /*argc*/, const char ** /*argv*/) {
 
     OSTime lastReport = OSGetTime();
     uint32_t encoded  = 0;
-    (void) encoded; // only read by the DEBUG-only log below
+    uint32_t lastFramesSent = StreamSender::GetFramesSent();
+    uint64_t lastBytesSent  = StreamSender::GetBytesSent();
+    (void) encoded;        // only read by the DEBUG-only log below
+    (void) lastFramesSent; // ditto
+    (void) lastBytesSent;
 
     // The stop sentinel is the *only* exit. Checking sShouldExit here as well
     // would let a thread that was mid-encode when Stop() was called leave the
@@ -351,12 +376,36 @@ int threadEntry(int /*argc*/, const char ** /*argv*/) {
         encoded++;
 
         const OSTime now = OSGetTime();
-        if (OSTicksToSeconds(now - lastReport) >= 5) {
-            DEBUG_FUNCTION_LINE("%u frames encoded in the last 5s (captured %u, dropped %u, send failures %u)",
-                                encoded, ScreenCapture::GetCapturedCount(),
+        const uint32_t elapsedS = (uint32_t) OSTicksToSeconds(now - lastReport);
+        if (elapsedS >= 5) {
+            const uint32_t framesSent = StreamSender::GetFramesSent() - lastFramesSent;
+            const uint64_t bytesSent  = StreamSender::GetBytesSent() - lastBytesSent;
+            const uint32_t avgEncodeUs = sEncodeCount ? (uint32_t) (sEncodeUs / sEncodeCount) : 0;
+            const uint32_t avgBytes    = framesSent ? (uint32_t) (bytesSent / framesSent) : 0;
+            // Bits/second on the wire this window, so the console log alone shows
+            // whether the encoder or the link is the limit.
+            const uint32_t mbitx100 = elapsedS ? (uint32_t) ((bytesSent * 8ull) / (elapsedS * 10000ull)) : 0;
+
+            // Only read by the DEBUG_FUNCTION_LINE below, which compiles to while(0)
+            // in a release build - void them so that build stays warning-clean.
+            (void) avgEncodeUs;
+            (void) avgBytes;
+            (void) mbitx100;
+
+            DEBUG_FUNCTION_LINE("capture %u fps | encode %u fps (%u.%02u ms) | tx %u fps %u.%02u Mbit/s | "
+                                "avg %u KB | dropped %u | sendfail %u",
+                                ScreenCapture::GetCapturedCount() / elapsedS,
+                                encoded / elapsedS, avgEncodeUs / 1000, (avgEncodeUs % 1000) / 10,
+                                framesSent / elapsedS, mbitx100 / 100, mbitx100 % 100,
+                                avgBytes / 1024,
                                 ScreenCapture::GetSkippedCount(), StreamSender::GetSendFailures());
-            encoded    = 0;
-            lastReport = now;
+
+            encoded       = 0;
+            sEncodeUs     = 0;
+            sEncodeCount  = 0;
+            lastFramesSent = StreamSender::GetFramesSent();
+            lastBytesSent  = StreamSender::GetBytesSent();
+            lastReport    = now;
             ScreenCapture::ResetCounters();
         }
     }

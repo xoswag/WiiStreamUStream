@@ -65,6 +65,13 @@ public final class UDPClient implements Runnable {
      */
     private volatile InetAddress expectedSource = null;
 
+    /** Datagrams dropped because they came from a host other than the connected console. */
+    private final java.util.concurrent.atomic.AtomicLong wrongSourceDiscards = new java.util.concurrent.atomic.AtomicLong();
+
+    public long getWrongSourceDiscards() {
+        return wrongSourceDiscards.get();
+    }
+
     public interface PacketHandler {
         void onPacket(byte[] data, int length);
     }
@@ -102,6 +109,7 @@ public final class UDPClient implements Runnable {
 
             final InetAddress expected = expectedSource;
             if (expected != null && !expected.equals(receivePacket.getAddress())) {
+                wrongSourceDiscards.incrementAndGet();
                 continue;
             }
 

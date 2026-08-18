@@ -37,37 +37,61 @@ So v2 makes every datagram self-describing. Loss is still loss — but it is now
 to the frame that lost a packet, it is detected immediately, and it can never desync the
 stream or crash the client.
 
-## v2 datagram
+## v3 datagram
 
-Every datagram is a 24-byte header plus payload. All fields big-endian (the Wii U is a
+Every datagram is a 44-byte header plus payload. All fields big-endian (the Wii U is a
 big-endian PowerPC; this is also Java's `ByteBuffer` default, so neither side byte-swaps).
+
+v3 makes each datagram fully self-describing: it carries a timestamp, the frame's
+width/height/stride, the compression type and the pixel format, so the client renders
+whatever a frame declares itself to be rather than assuming JPEG at a fixed size. That is
+what lets one wire format carry JPEG today and RAW or a lightweight codec later without the
+client being told in advance which to expect.
 
 ```
  offset  size  field
-      0     4  magic       0x57555332  ('W','U','S','2')
-      4     4  frameId     increments by 1 per frame, wraps freely
-      8     4  frameSize   total JPEG size in bytes
-     12     4  chunkOffset byte offset of this chunk inside the frame
-     16     2  chunkLen    payload bytes in this datagram
-     18     1  flags       bit0 = last chunk of the frame
-     19     1  version     2
-     20     4  frameCrc    CRC-32 of the whole JPEG, repeated in every chunk
-     24  chunkLen  payload
+      0     4  magic           0x57555333  ('W','U','S','3')
+      4     4  frameId         increments by 1 per frame, wraps freely
+      8     8  timestampUs     console clock in microseconds, frame-constant
+     16     4  frameSize       total payload size in bytes
+     20     4  chunkOffset     byte offset of this chunk inside the frame
+     24     4  frameCrc        CRC-32 of the whole payload, repeated in every chunk
+     28     2  width           frame width in pixels
+     30     2  height          frame height in pixels
+     32     4  stride          bytes per row for RAW, 0 for JPEG
+     36     2  chunkLen        payload bytes in this datagram
+     38     1  flags           bit0 = last chunk, bit1 = keyframe
+     39     1  version         3
+     40     1  compressionType 0 = RAW, 1 = LIGHTWEIGHT, 2 = JPEG
+     41     1  pixelFormat     0 = JPEG, 1 = RGB888, 2 = RGBA8888
+     42     2  reserved        0
+     44  chunkLen  payload
 ```
 
-`STREAM_MAX_PAYLOAD` is 1376, so a full datagram is 1400 bytes on the wire — inside the
-1472-byte ceiling for a 1500-byte-MTU LAN, so IP never fragments it.
+`STREAM_MAX_PAYLOAD` is 1376, so a full datagram is 1420 bytes on the wire — inside the
+1472-byte ceiling for a 1500-byte-MTU LAN, so IP never fragments it. The payload size and
+chunk stride are unchanged from v2, so the reassembly and per-chunk seen-set logic did not
+change — only the header grew.
 
-`frameCrc` is repeated in every chunk on purpose: it costs 4 bytes and it means a client
-that joins mid-frame, or that lost the first chunk, can still validate whatever it does
-manage to assemble instead of having to guess.
+The whole-frame fields (`frameSize`, `frameCrc`, `timestampUs`, `width`, `height`,
+`stride`, `compressionType`, `pixelFormat`) are repeated identically in every chunk, so a
+client that joined mid-frame or lost the first chunk can still validate and decode whatever
+it does manage to assemble instead of having to guess.
+
+`timestampUs` is the console's own clock. It is for ordering and jitter measurement only —
+the two clocks are not synchronised, so a difference against the PC clock is **not** a
+latency measurement.
 
 ## Receiver rules
 
 * Drop anything whose `magic` or `version` doesn't match, or whose actual datagram length
-  isn't `24 + chunkLen`.
+  isn't `44 + chunkLen`.
 * Sanity-check `frameSize` against a hard cap (`MAX_FRAME_BYTES`, 8 MB) and
   `chunkOffset + chunkLen <= frameSize` **before** allocating or copying anything.
+* For a `RAW` frame, require `stride >= width * bytesPerPixel` and
+  `height * stride == frameSize` before trusting the geometry — otherwise a spoofed
+  width/height is an out-of-bounds read waiting to happen. JPEG carries its own dimensions,
+  so its header `width`/`height`/`stride` are advisory.
 * Assemble into a buffer keyed by `frameId`. A datagram for a newer `frameId` retires the
   frame in progress — incomplete frames are discarded, never rendered.
 * **Clear the staleness filter on every (re)connect.** `frameId` is monotonic only within one
@@ -88,7 +112,7 @@ implementation directly.
 
 ## Mixing versions
 
-A v1 client pointed at a v2 plugin sees no valid frames (its first datagram is 1400 bytes,
-not 4, so it stays in `UNKNOWN` forever) and shows a black window. A v2 client pointed at a
-v1 plugin logs `ignoring N non-v2 datagrams - is the Wii U running the old plugin?` once a
-second. Use the matching pair.
+The magic and version are bumped together (`WUS2`/2 → `WUS3`/3), so a mismatched pair simply
+rejects every datagram rather than misparsing one. A client built for a different protocol
+version sees no valid frames and shows a black window while `ignored=` climbs in its stats
+line. Always run the plugin and client from the same build.

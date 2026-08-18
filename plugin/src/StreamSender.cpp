@@ -22,6 +22,7 @@
 #include <arpa/inet.h> // htons
 #include <coreinit/fastmutex.h>
 #include <coreinit/thread.h>
+#include <coreinit/time.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <string.h>
@@ -36,6 +37,8 @@ OSFastMutex sMutex;
 int sSocket = -1;
 uint32_t sFrameId = 0;
 uint32_t sSendFailures = 0;
+uint32_t sFramesSent = 0;
+uint64_t sBytesSent = 0;
 crc32_t sCrc;
 
 uint8_t sPacket[STREAM_HEADER_SIZE + STREAM_MAX_PAYLOAD];
@@ -147,8 +150,8 @@ bool IsOpen() {
     return open;
 }
 
-bool SendFrame(const uint8_t *jpeg, uint32_t size) {
-    if (jpeg == nullptr || size == 0) {
+bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta) {
+    if (payload == nullptr || size == 0) {
         return false;
     }
 
@@ -159,30 +162,38 @@ bool SendFrame(const uint8_t *jpeg, uint32_t size) {
         return false;
     }
 
-    const uint32_t frameCrc = crc32_crc(&sCrc, jpeg, size);
-    const uint32_t frameId  = sFrameId++;
+    const uint32_t frameCrc     = crc32_crc(&sCrc, payload, size);
+    const uint32_t frameId      = sFrameId++;
+    const uint64_t timestampUs  = OSTicksToMicroseconds(OSGetSystemTime());
 
     bool ok = true;
     for (uint32_t offset = 0; offset < size;) {
         const uint32_t remaining = size - offset;
         const uint16_t chunkLen  = (uint16_t) (remaining > STREAM_MAX_PAYLOAD ? STREAM_MAX_PAYLOAD : remaining);
 
-        auto *header        = (StreamPacketHeader *) sPacket;
-        header->magic       = STREAM_MAGIC;
-        header->frameId     = frameId;
-        header->frameSize   = size;
-        header->chunkOffset = offset;
-        header->chunkLen    = chunkLen;
-        header->flags       = (offset + chunkLen >= size) ? STREAM_FLAG_LAST : 0;
-        header->version     = STREAM_VERSION;
-        header->frameCrc    = frameCrc;
+        auto *header            = (StreamPacketHeader *) sPacket;
+        header->magic           = STREAM_MAGIC;
+        header->frameId         = frameId;
+        header->timestampUs     = timestampUs;
+        header->frameSize       = size;
+        header->chunkOffset     = offset;
+        header->frameCrc        = frameCrc;
+        header->width           = meta.width;
+        header->height          = meta.height;
+        header->stride          = meta.stride;
+        header->chunkLen        = chunkLen;
+        header->flags           = STREAM_FLAG_KEYFRAME | ((offset + chunkLen >= size) ? STREAM_FLAG_LAST : 0);
+        header->version         = STREAM_VERSION;
+        header->compressionType = meta.compressionType;
+        header->pixelFormat     = meta.pixelFormat;
+        header->reserved        = 0;
 
-        memcpy(sPacket + STREAM_HEADER_SIZE, jpeg + offset, chunkLen);
+        memcpy(sPacket + STREAM_HEADER_SIZE, payload + offset, chunkLen);
 
         if (!sendDatagram(sPacket, STREAM_HEADER_SIZE + chunkLen)) {
-            // Abandon the rest of the frame. Under v2 the client simply never
-            // completes this frame id and moves on at the next one, so a partial
-            // send costs one frame instead of desynchronising the stream.
+            // Abandon the rest of the frame. The client simply never completes
+            // this frame id and moves on at the next one, so a partial send
+            // costs one frame instead of desynchronising the stream.
             sSendFailures++;
             ok = false;
             break;
@@ -191,12 +202,34 @@ bool SendFrame(const uint8_t *jpeg, uint32_t size) {
         offset += chunkLen;
     }
 
+    if (ok) {
+        sFramesSent++;
+        sBytesSent += size;
+    }
+
     OSFastMutex_Unlock(&sMutex);
     return ok;
 }
 
 uint32_t GetSendFailures() {
     return sSendFailures;
+}
+
+uint32_t GetFramesSent() {
+    OSFastMutex_Lock(&sMutex);
+    const uint32_t v = sFramesSent;
+    OSFastMutex_Unlock(&sMutex);
+    return v;
+}
+
+uint64_t GetBytesSent() {
+    // Under the lock because a 64-bit load is two 32-bit loads on this PPC and
+    // SendFrame writes this counter; an unlocked read could tear mid-update and
+    // print a nonsense Mbit/s figure in the diagnostics.
+    OSFastMutex_Lock(&sMutex);
+    const uint64_t v = sBytesSent;
+    OSFastMutex_Unlock(&sMutex);
+    return v;
 }
 
 } // namespace StreamSender

@@ -30,6 +30,19 @@
 namespace StreamSender {
 
 /**
+ * Everything the header needs that is not the payload itself. Kept as a small
+ * value so the encoder can describe a JPEG, a RAW frame, or a future mode
+ * without SendFrame growing a new argument each time.
+ */
+struct FrameMeta {
+    uint16_t width;
+    uint16_t height;
+    uint32_t stride;          // bytes per row for RAW, 0 for JPEG
+    uint8_t compressionType;  // STREAM_COMP_*
+    uint8_t pixelFormat;      // STREAM_PIXFMT_*
+};
+
+/**
  * Initialises the module's lock. Call once from INITIALIZE_PLUGIN, before any
  * other thread exists - lazily initialising it inside Open()/Close() means two
  * first callers can re-initialise a mutex one of them already holds.
@@ -44,9 +57,13 @@ void Close();
 
 bool IsOpen();
 
-/** Splits one JPEG into v2 datagrams. Returns false if the frame was not fully sent. */
-bool SendFrame(const uint8_t *jpeg, uint32_t size);
+/** Splits one frame into v3 datagrams. Returns false if it was not fully sent. */
+bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta);
 
 uint32_t GetSendFailures();
+
+// --- Instrumentation. Monotonic counters, read on the encoder's report tick. --
+uint32_t GetFramesSent();
+uint64_t GetBytesSent();
 
 } // namespace StreamSender

@@ -28,7 +28,7 @@ import java.util.function.Consumer;
 import java.util.zip.CRC32;
 
 /**
- * Reassembles v2 datagrams into whole JPEG frames.
+ * Reassembles v3 datagrams into whole frames.
  *
  * Only ever one frame is in flight: the Wii U sends a frame's chunks back to back and
  * never interleaves two frames, so a datagram belonging to a newer frame is proof that
@@ -38,16 +38,25 @@ import java.util.zip.CRC32;
  * Not thread safe - drive it from the single UDP receive thread.
  */
 public final class FrameAssembler {
-    private final Consumer<byte[]> onFrame;
+    private final Consumer<Frame> onFrame;
     private final CRC32 crc = new CRC32();
 
     private boolean haveFrame = false;
     private boolean haveCompleted = false;
     private int lastCompletedFrameId;
     private volatile boolean sessionReset = false;
+
+    // Metadata of the frame currently being assembled.
     private int frameId;
     private int frameSize;
     private int frameCrc;
+    private long frameTimestampUs;
+    private int frameWidth;
+    private int frameHeight;
+    private int frameStride;
+    private int frameComp;
+    private int framePixfmt;
+
     private byte[] buffer = new byte[0];
     private int receivedBytes;
     /** One bit per chunk slot, so a duplicated datagram cannot be counted twice. */
@@ -60,28 +69,28 @@ public final class FrameAssembler {
     private volatile long datagramsIgnored = 0;
     private volatile long bytesReceived = 0;
 
-    public FrameAssembler(Consumer<byte[]> onFrame) {
+    public FrameAssembler(Consumer<Frame> onFrame) {
         this.onFrame = onFrame;
     }
 
     /**
-     * @param data one datagram exactly as it came off the wire
-     * @param length valid bytes in {@code data}
-     */
-    /**
      * Forgets which frame ids have been seen. Call on every (re)connect: the
-     * console restarts its frame counter whenever the plugin is reloaded — which
-     * a title change does — and without this the staleness filter would reject
+     * console restarts its frame counter whenever the plugin is reloaded - which
+     * a title change does - and without this the staleness filter would reject
      * the whole new session until its counter climbed past the old one.
      */
     public void requestReset() {
         sessionReset = true;
     }
 
+    /**
+     * @param data one datagram exactly as it came off the wire
+     * @param length valid bytes in {@code data}
+     */
     public void accept(byte[] data, int length) {
         if (sessionReset) {
-            sessionReset  = false;
-            haveFrame     = false;
+            sessionReset = false;
+            haveFrame = false;
             haveCompleted = false;
         }
 
@@ -99,10 +108,16 @@ public final class FrameAssembler {
         }
 
         final int pktFrameId = h.getInt(StreamProtocol.OFF_FRAME_ID);
+        final long pktTimestampUs = h.getLong(StreamProtocol.OFF_TIMESTAMP_US);
         final int pktFrameSize = h.getInt(StreamProtocol.OFF_FRAME_SIZE);
         final int pktChunkOffset = h.getInt(StreamProtocol.OFF_CHUNK_OFFSET);
-        final int pktChunkLen = h.getShort(StreamProtocol.OFF_CHUNK_LEN) & 0xFFFF;
         final int pktFrameCrc = h.getInt(StreamProtocol.OFF_FRAME_CRC);
+        final int pktWidth = h.getShort(StreamProtocol.OFF_WIDTH) & 0xFFFF;
+        final int pktHeight = h.getShort(StreamProtocol.OFF_HEIGHT) & 0xFFFF;
+        final int pktStride = h.getInt(StreamProtocol.OFF_STRIDE);
+        final int pktChunkLen = h.getShort(StreamProtocol.OFF_CHUNK_LEN) & 0xFFFF;
+        final int pktComp = data[StreamProtocol.OFF_COMPRESSION] & 0xFF;
+        final int pktPixfmt = data[StreamProtocol.OFF_PIXEL_FORMAT] & 0xFF;
 
         // Validate everything before it is allowed to size an allocation or an arraycopy.
         // A corrupt or spoofed datagram must not be able to do anything worse than be
@@ -129,6 +144,13 @@ public final class FrameAssembler {
             datagramsIgnored++;
             return;
         }
+        // For a raw layout, the declared geometry must exactly account for the frame
+        // size, otherwise a decoder would read past the row it was handed. JPEG carries
+        // its own dimensions so its header width/height/stride are advisory only.
+        if (pktComp == StreamProtocol.COMP_RAW && !rawGeometryValid(pktPixfmt, pktWidth, pktHeight, pktStride, pktFrameSize)) {
+            datagramsIgnored++;
+            return;
+        }
 
         if (!haveFrame || pktFrameId != frameId) {
             // A duplicate of a frame we already finished must not restart it, and
@@ -142,10 +164,13 @@ public final class FrameAssembler {
             if (haveFrame) {
                 framesIncomplete++;
             }
-            startFrame(pktFrameId, pktFrameSize, pktFrameCrc);
-        } else if (pktFrameSize != frameSize || pktFrameCrc != frameCrc) {
-            // Same id but disagreeing metadata: one of the two is corrupt. Drop the chunk
-            // rather than mixing them.
+            startFrame(pktFrameId, pktFrameSize, pktFrameCrc, pktTimestampUs, pktWidth, pktHeight, pktStride, pktComp,
+                    pktPixfmt);
+        } else if (pktFrameSize != frameSize || pktFrameCrc != frameCrc || pktComp != frameComp
+                || pktPixfmt != framePixfmt || pktWidth != frameWidth || pktHeight != frameHeight
+                || pktStride != frameStride) {
+            // Same id but disagreeing metadata: one of the two is corrupt. Drop the
+            // chunk rather than mixing them.
             datagramsIgnored++;
             return;
         }
@@ -166,10 +191,25 @@ public final class FrameAssembler {
         }
     }
 
-    private void startFrame(int id, int size, int expectedCrc) {
+    private static boolean rawGeometryValid(int pixfmt, int width, int height, int stride, int frameSize) {
+        final int bpp = StreamProtocol.bytesPerPixel(pixfmt);
+        if (bpp == 0 || width <= 0 || height <= 0 || stride < width * bpp) {
+            return false;
+        }
+        return (long) height * stride == frameSize;
+    }
+
+    private void startFrame(int id, int size, int expectedCrc, long timestampUs, int width, int height, int stride,
+            int comp, int pixfmt) {
         frameId = id;
         frameSize = size;
         frameCrc = expectedCrc;
+        frameTimestampUs = timestampUs;
+        frameWidth = width;
+        frameHeight = height;
+        frameStride = stride;
+        frameComp = comp;
+        framePixfmt = pixfmt;
         receivedBytes = 0;
         seenChunks.clear();
         if (buffer.length < size) {
@@ -179,8 +219,8 @@ public final class FrameAssembler {
     }
 
     private void completeFrame() {
-        haveFrame            = false;
-        haveCompleted        = true;
+        haveFrame = false;
+        haveCompleted = true;
         lastCompletedFrameId = frameId;
 
         crc.reset();
@@ -193,9 +233,10 @@ public final class FrameAssembler {
         framesCompleted++;
         // Hand out a right-sized copy: the caller decodes it on another thread and our
         // scratch buffer gets reused by the very next datagram.
-        final byte[] frame = new byte[frameSize];
-        System.arraycopy(buffer, 0, frame, 0, frameSize);
-        onFrame.accept(frame);
+        final byte[] payload = new byte[frameSize];
+        System.arraycopy(buffer, 0, payload, 0, frameSize);
+        onFrame.accept(new Frame(payload, frameComp, framePixfmt, frameWidth, frameHeight, frameStride,
+                frameTimestampUs));
     }
 
     /** Serial-number comparison, so the counter wrapping past 2^31 is not a discontinuity. */
