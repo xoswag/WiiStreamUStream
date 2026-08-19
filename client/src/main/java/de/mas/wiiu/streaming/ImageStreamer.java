@@ -82,8 +82,17 @@ public class ImageStreamer {
     private static final int MAX_MISSED_PINGS = 3;
     private int missedPings = 0;
 
+    /**
+     * How long to wait for a PONG. Deliberately long: under a heavy title the
+     * console's control thread can be descheduled for seconds, and treating that
+     * as a disconnect tears down a working video stream for no reason. Combined
+     * with MAX_MISSED_PINGS this tolerates ~15s of unresponsiveness before giving
+     * up, which is still far quicker than a human would notice a real hang.
+     */
+    private static final int CONTROL_TIMEOUT_MS = 5000;
+
     public ImageStreamer(String ip) throws SocketException {
-        tcpClient = new TCPClient(ip, StreamProtocol.TCP_PORT, 2000);
+        tcpClient = new TCPClient(ip, StreamProtocol.TCP_PORT, CONTROL_TIMEOUT_MS);
         udpClient = new UDPClient(StreamProtocol.UDP_PORT);
         assembler = new FrameAssembler(this::onFrameAssembled);
 

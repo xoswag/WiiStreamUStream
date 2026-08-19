@@ -36,16 +36,30 @@ namespace {
 constexpr uint32_t THREAD_STACK_SIZE = 0x8000;
 
 /**
- * Above the encoder's priority (25) so a ping is always answered promptly,
- * even while the encoder is mid-frame on this same core. The heartbeat runs
- * for only a few microseconds a second, so out-prioritising the encoder costs
- * nothing - and answering late was making the client time out and tear the
- * whole stream down, which is the multi-second freeze/reconnect loop.
+ * Deliberately above typical game threads, not just above the encoder.
+ *
+ * Lower number = higher priority on Cafe OS, and an application's main threads
+ * usually sit around 16. The first attempt at fixing the reconnect loop used 18,
+ * which beats our own encoder (25) but still loses to the game - so under a heavy
+ * title (Minecraft) this thread went unscheduled for seconds at a time, the client
+ * gave up waiting for a PONG, and the session died and relaunched in a loop while
+ * the game itself ran perfectly.
+ *
+ * Running it above the game is safe precisely because it does almost nothing: it
+ * wakes 4 times a second, reads one byte and writes one back. Microseconds of CPU
+ * against a frame budget of 16 ms.
  */
-constexpr int32_t CONTROL_THREAD_PRIORITY = 18;
+constexpr int32_t CONTROL_THREAD_PRIORITY = 10;
 
-/** A client that has not pinged in this long is treated as gone. */
-constexpr int CLIENT_TIMEOUT_MS = 5000;
+/**
+ * A client that has not pinged in this long is treated as gone.
+ *
+ * Generous on purpose: dropping a client is expensive (it tears down the video
+ * socket and the client has to reconnect), and the cost of waiting a little
+ * longer is nothing. The client pings once a second, so this tolerates ten
+ * consecutive missed pings.
+ */
+constexpr int CLIENT_TIMEOUT_MS = 10000;
 
 /**
  * How long the heartbeat blocks before re-checking sShouldExit.
