@@ -29,6 +29,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+// The Wii U socket library's own flag. Not always exposed by the headers, and its
+// value is fixed by the OS, so define it if we have to rather than depend on it.
+#ifndef SO_NONBLOCK
+#define SO_NONBLOCK 0x1016
+#endif
+
 namespace StreamSender {
 namespace {
 
@@ -51,7 +57,20 @@ uint8_t sPacket[STREAM_HEADER_SIZE + STREAM_MAX_PAYLOAD];
  */
 constexpr int WANTED_SEND_BUFFER = 4 * 1024 * 1024;
 
-constexpr int MAX_SEND_RETRIES = 200;
+/**
+ * Total time SendFrame may spend pushing one frame out.
+ *
+ * The budget has to be per frame, not per datagram. A 720p frame is ~93
+ * datagrams, so a 100ms-per-datagram allowance is a 9-second worst case - and
+ * all of it is held under sMutex, which Close() and in turn ImageEncoder::Stop()
+ * and the config menu all wait on. Abandoning a frame is cheap (the client just
+ * never completes that frame id), so the right behaviour under real congestion
+ * is to give up quickly and let the next frame try.
+ */
+constexpr uint32_t FRAME_SEND_BUDGET_MS = 200;
+
+/** Secondary bound, so one wedged datagram cannot eat the whole frame budget. */
+constexpr int MAX_SEND_RETRIES = 20;
 
 void closeLocked() {
     if (sSocket >= 0) {
@@ -61,7 +80,7 @@ void closeLocked() {
 }
 
 /** Sends one datagram whole, retrying while the stack is congested. */
-bool sendDatagram(const uint8_t *data, uint32_t length) {
+bool sendDatagram(const uint8_t *data, uint32_t length, OSTime deadline) {
     for (int attempt = 0; attempt < MAX_SEND_RETRIES; attempt++) {
         const int ret = send(sSocket, data, (int) length, 0);
         if (ret == (int) length) {
@@ -75,6 +94,9 @@ bool sendDatagram(const uint8_t *data, uint32_t length) {
             return false;
         }
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS) {
+            return false;
+        }
+        if (OSGetSystemTime() >= deadline) {
             return false;
         }
         // Congested rather than broken - let the stack drain and try again.
@@ -99,6 +121,20 @@ bool Open(uint32_t clientIp) {
         DEBUG_FUNCTION_LINE_ERR("Failed to create the UDP socket (errno %d)", errno);
         OSFastMutex_Unlock(&sMutex);
         return false;
+    }
+
+    // Non-blocking, so a congested stack returns EAGAIN and the deadline in
+    // SendFrame governs how long we spend here. On a blocking socket send() can
+    // park indefinitely - and because ImageEncoder::Stop() joins this thread, that
+    // hang propagates up to freezing the config menu on an encoder-core change.
+    //
+    // This is setsockopt, not fcntl: the Wii U socket layer does not implement
+    // F_SETFL, so fcntl compiles fine and then silently does nothing at runtime.
+    int nonBlocking = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NONBLOCK, &nonBlocking, sizeof(nonBlocking)) < 0) {
+        DEBUG_FUNCTION_LINE_WARN("Could not set the socket non-blocking (errno %d); "
+                                 "a stalled send may block the encoder",
+                                 errno);
     }
 
     // Hardware rejected a flat 4 MB request with EINVAL and silently kept the
@@ -175,6 +211,7 @@ bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta) {
     const uint32_t frameCrc     = crc32_crc(&sCrc, payload, size);
     const uint32_t frameId      = sFrameId++;
     const uint64_t timestampUs  = OSTicksToMicroseconds(OSGetSystemTime());
+    const OSTime deadline       = OSGetSystemTime() + OSMillisecondsToTicks(FRAME_SEND_BUDGET_MS);
 
     bool ok = true;
     for (uint32_t offset = 0; offset < size;) {
@@ -200,7 +237,7 @@ bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta) {
 
         memcpy(sPacket + STREAM_HEADER_SIZE, payload + offset, chunkLen);
 
-        if (!sendDatagram(sPacket, STREAM_HEADER_SIZE + chunkLen)) {
+        if (!sendDatagram(sPacket, STREAM_HEADER_SIZE + chunkLen, deadline)) {
             // Abandon the rest of the frame. The client simply never completes
             // this frame id and moves on at the next one, so a partial send
             // costs one frame instead of desynchronising the stream.
