@@ -101,10 +101,19 @@ bool Open(uint32_t clientIp) {
         return false;
     }
 
-    int sndBuf = WANTED_SEND_BUFFER;
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndBuf, sizeof(sndBuf)) < 0) {
-        // Not fatal, just lossier under load.
-        DEBUG_FUNCTION_LINE_WARN("Could not raise SO_SNDBUF (errno %d)", errno);
+    // Hardware rejected a flat 4 MB request with EINVAL and silently kept the
+    // default, so walk down until one is accepted rather than giving up.
+    static const int kSendBufferSizes[] = {WANTED_SEND_BUFFER, 1024 * 1024, 512 * 1024, 256 * 1024, 128 * 1024};
+    for (int size : kSendBufferSizes) {
+        int sndBuf = size;
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndBuf, sizeof(sndBuf)) == 0) {
+            DEBUG_FUNCTION_LINE("SO_SNDBUF set to %d bytes", size);
+            break;
+        }
+        if (size == kSendBufferSizes[(sizeof(kSendBufferSizes) / sizeof(kSendBufferSizes[0])) - 1]) {
+            // Not fatal, just lossier under load.
+            DEBUG_FUNCTION_LINE_WARN("Could not raise SO_SNDBUF at any size (errno %d)", errno);
+        }
     }
 
     struct sockaddr_in addr;

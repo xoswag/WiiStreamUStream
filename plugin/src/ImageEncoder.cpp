@@ -49,7 +49,33 @@ void *sThreadStack = nullptr;
 // itself versus the surrounding memory work.
 uint64_t sEncodeUs = 0;
 uint64_t sCompressUs = 0;
+uint64_t sSendUs = 0;
 uint32_t sEncodeCount = 0;
+
+/**
+ * A fixed amount of pure-register integer work, timed on the encoder thread once
+ * per report window.
+ *
+ * The absolute figure is meaningless - what matters is the RATIO between a quiet
+ * scene and a busy one. This thread runs at priority 25, so Cafe OS (strict
+ * priority, no round-robin among equals) only schedules it when nothing more
+ * important on its core is runnable. Every measurement we take around
+ * tjCompress2 or send() is wall clock, so it silently includes time the thread
+ * spent descheduled. Timing known work is the one way to see that dilation
+ * directly, and it needs no OS API we would have to guess at.
+ */
+volatile uint32_t sCalibrationSink = 0;
+
+uint32_t measureDilationUs() {
+    constexpr uint32_t ITERATIONS = 200000;
+    const OSTime start = OSGetSystemTime();
+    uint32_t x = 1;
+    for (uint32_t i = 0; i < ITERATIONS; i++) {
+        x = x * 3u + 1u;
+    }
+    sCalibrationSink = x; // keep the loop from being optimised away
+    return (uint32_t) OSTicksToMicroseconds(OSGetSystemTime() - start);
+}
 
 tjhandle sTjHandle = nullptr;
 
@@ -352,7 +378,15 @@ void encodeAndSend(CaptureSlot *slot) {
             .compressionType = STREAM_COMP_JPEG,
             .pixelFormat     = STREAM_PIXFMT_JPEG,
     };
+
+    // Timed separately from the encode. Working back from the reported bitrate
+    // showed 30-50% of every frame's wall time was being spent here and going
+    // completely unmeasured: a 720p frame is ~93 datagrams and each send() is a
+    // blocking IPC round trip to IOSU. Encode and send are serialised on this one
+    // thread, so this cost is directly in the frame-rate path.
+    const OSTime sendStart = OSGetSystemTime();
     StreamSender::SendFrame(sJpegBuffer, (uint32_t) jpegSize, meta);
+    sSendUs += OSTicksToMicroseconds(OSGetSystemTime() - sendStart);
 }
 
 int threadEntry(int /*argc*/, const char ** /*argv*/) {
@@ -419,7 +453,9 @@ int threadEntry(int /*argc*/, const char ** /*argv*/) {
 
             const uint32_t avgEncodeUs = encodeCnt ? (uint32_t) (sEncodeUs / encodeCnt) : 0;
             const uint32_t avgJpegUs   = encodeCnt ? (uint32_t) (sCompressUs / encodeCnt) : 0;
+            const uint32_t avgSendUs   = encodeCnt ? (uint32_t) (sSendUs / encodeCnt) : 0;
             const uint32_t avgBytes    = framesSent ? (uint32_t) (bytesSent / framesSent) : 0;
+            const uint32_t dilationUs  = measureDilationUs();
 
             // Rates over the real window. present is the ceiling (game present rate);
             // encBusy is the honest "encoder could not take the frame, no free slot"
@@ -438,6 +474,7 @@ int threadEntry(int /*argc*/, const char ** /*argv*/) {
             // while(0) in a release build - void them so that build stays warning-clean.
             (void) avgEncodeUs;
             (void) avgJpegUs;
+            (void) avgSendUs;
             (void) avgBytes;
             (void) mbitx100;
             (void) presentFps;
@@ -445,17 +482,25 @@ int threadEntry(int /*argc*/, const char ** /*argv*/) {
             (void) encodeFps;
             (void) txFps;
             (void) encBusyPerS;
+            (void) dilationUs;
 
             DEBUG_FUNCTION_LINE("[fps] present %u | capture %u | encode %u | tx %u   (enc-busy %u/s, sendfail %u total)",
                                 presentFps, captureFps, encodeFps, txFps, encBusyPerS,
                                 StreamSender::GetSendFailures());
-            DEBUG_FUNCTION_LINE("[cost] encode %u.%02u ms (jpeg %u.%02u ms) | %u.%02u Mbit/s | avg %u KB/frame",
+            DEBUG_FUNCTION_LINE("[cost] encode %u.%02u ms (jpeg %u.%02u) | send %u.%02u ms | %u.%02u Mbit/s | avg %u KB/frame",
                                 avgEncodeUs / 1000, (avgEncodeUs % 1000) / 10,
                                 avgJpegUs / 1000, (avgJpegUs % 1000) / 10,
+                                avgSendUs / 1000, (avgSendUs % 1000) / 10,
                                 mbitx100 / 100, mbitx100 % 100, avgBytes / 1024);
+            // Compare this across runs: if it doubles when the scene gets busy, the
+            // encode/send figures above are inflated by that same factor and the
+            // real compute cost is correspondingly lower.
+            DEBUG_FUNCTION_LINE("[load] cpu-check %u us for fixed work (higher = this thread is being starved)",
+                                dilationUs);
 
             sEncodeUs     = 0;
             sCompressUs   = 0;
+            sSendUs       = 0;
             sEncodeCount  = 0;
             lastFramesSent    = StreamSender::GetFramesSent();
             lastBytesSent     = StreamSender::GetBytesSent();
