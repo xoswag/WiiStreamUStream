@@ -46,8 +46,22 @@ std::atomic<int> sGpuFailures{0};
 std::atomic<int> sErrors{0};
 std::atomic<uint32_t> sPresented{0}, sCaptured{0};
 
+// Frame contents repeat every CONTENT_CYCLE frames. Each is generated once into
+// its own 0x800-aligned buffer and the slot is then *pointed* at it rather than
+// filled by a 3.6 MB memcpy per frame: on a two-vCPU runner that copy was the
+// biggest competitor to the very encoder threads whose timing the scenarios
+// measure. The buffers outlive every scenario's encoder, so a follower that is
+// late reading one is reading valid memory, as on the console.
 constexpr uint32_t CONTENT_CYCLE = 16;
-std::vector<uint32_t> sCache[CONTENT_CYCLE];
+uint32_t *sCache[CONTENT_CYCLE] = {};
+void *sOwnImage[CAPTURE_SLOT_COUNT] = {};
+
+void freeCache() {
+    for (auto &c : sCache) {
+        free(c);
+        c = nullptr;
+    }
+}
 
 fakes::SubmitHandler sHandler = nullptr;
 std::atomic<uint32_t> sSubmitted{0};
@@ -87,14 +101,15 @@ void producerLoop(uint32_t pacingUs) {
             sFree.pop_front();
             sState[idx] = SlotState::Filling;
         }
-        const uint32_t id             = sNextFrame++;
-        GX2Surface &s                 = sSlots[idx].colorBuffer.surface;
-        std::vector<uint32_t> &cached = sCache[id % CONTENT_CYCLE];
-        if (cached.empty()) {
-            cached.resize((size_t) sPitch * sHeight);
-            fakes::fillFrame(cached.data(), sWidth, sHeight, sPitch, id);
+        const uint32_t id = sNextFrame++;
+        GX2Surface &s     = sSlots[idx].colorBuffer.surface;
+        uint32_t *&cached = sCache[id % CONTENT_CYCLE];
+        if (cached == nullptr) {
+            cached = (uint32_t *) aligned_alloc(0x800, s.imageSize);
+            memset(cached, 0, s.imageSize);
+            fakes::fillFrame(cached, sWidth, sHeight, sPitch, id);
         }
-        memcpy(s.image, cached.data(), cached.size() * sizeof(uint32_t));
+        s.image                  = cached;
         sSlots[idx].sourceIsSRGB = sSrgb;
         sSlots[idx].gpuTimestamp = 1;
         {
@@ -156,9 +171,7 @@ void captureSetup(uint32_t width, uint32_t height, bool srgb) {
     // GX2 pads a linear-aligned 32bpp surface's pitch to a multiple of 64 pixels.
     sPitch = (width + 63) & ~63u;
     sSrgb  = srgb;
-    for (auto &c : sCache) {
-        c.clear();
-    }
+    freeCache();
     sFree.clear();
     sReady.clear();
     for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) {
@@ -171,8 +184,12 @@ void captureSetup(uint32_t width, uint32_t height, bool srgb) {
         s.format      = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
         s.imageSize   = (sPitch * height * 4 + 0x7FF) & ~0x7FFu;
         s.alignment   = 0x800;
-        s.image       = aligned_alloc(0x800, s.imageSize);
-        memset(s.image, 0, s.imageSize);
+        // The slot's own buffer, as the real capture would allocate; the producer
+        // repoints s.image at a cached frame once it starts.
+        free(sOwnImage[i]);
+        sOwnImage[i] = aligned_alloc(0x800, s.imageSize);
+        memset(sOwnImage[i], 0, s.imageSize);
+        s.image            = sOwnImage[i];
         slot.imageCapacity = s.imageSize;
         sState[i]          = SlotState::Free;
         sFree.push_back(i);
@@ -193,9 +210,11 @@ void captureTeardown() {
                    i, readers);
             sErrors++;
         }
-        free(sSlots[i].colorBuffer.surface.image);
+        free(sOwnImage[i]);
+        sOwnImage[i]                        = nullptr;
         sSlots[i].colorBuffer.surface.image = nullptr;
     }
+    freeCache();
     sFree.clear();
     sReady.clear();
 }
