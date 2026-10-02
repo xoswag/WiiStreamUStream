@@ -741,6 +741,7 @@ int followerEntry(int argc, const char ** /*argv*/) {
         if (readJob(tag, job)) {
             w.lastOk = doBand(w, job, msg.args[1]);
         }
+        ScreenCapture::EndCpuRead(msg.args[2]);
         w.lastDoneAt = OSGetSystemTime();
         OSMemoryBarrier();
 
@@ -812,13 +813,18 @@ void drainDone() {
     }
 }
 
-bool dispatch(Worker &w, uint32_t tag, uint32_t band, OSTime now, bool probe) {
+bool dispatch(Worker &w, uint32_t tag, uint32_t band, OSTime now, bool probe, CaptureSlot *slot) {
     OSMessage msg;
     memset(&msg, 0, sizeof(msg));
     msg.message = (void *) (uintptr_t) MSG_BAND;
     msg.args[0] = tag;
     msg.args[1] = band;
+    msg.args[2] = ScreenCapture::SlotIndex(slot);
+    // Registered before the message goes out, unregistered by the follower when
+    // it is done reading - whether or not it found the job still current.
+    ScreenCapture::BeginCpuRead(slot);
     if (!OSSendMessage(&w.jobQueue, &msg, OS_MESSAGE_FLAGS_NONE)) {
+        ScreenCapture::EndCpuRead(msg.args[2]);
         return false;
     }
     w.outstandingTag = tag;
@@ -875,7 +881,7 @@ bool encodeFast(CaptureSlot *slot, const YuvConvert::Source &src, const YuvConve
     // Followers take the full-height bands; the leader takes the last one, the
     // remainder, because it also has the splice to do.
     for (uint32_t i = 0; i < helperCount; i++) {
-        if (!dispatch(*helpers[i], tag, i, now, false)) {
+        if (!dispatch(*helpers[i], tag, i, now, false, slot)) {
             // A follower that is not busy has an empty queue, so this cannot
             // happen - but if it did, that band would never be encoded. Bands
             // already handed out finish on their own and are simply not used.
@@ -905,7 +911,7 @@ bool encodeFast(CaptureSlot *slot, const YuvConvert::Source &src, const YuvConve
             probeTag = nextTag();
             publishJob(probeTag, FrameJob{src, dst, quality, trialH, trialBands});
         }
-        if (dispatch(w, probeTag, 0, now, true)) {
+        if (dispatch(w, probeTag, 0, now, true, slot)) {
             w.lastProbeAt = now;
         }
     }
@@ -940,8 +946,9 @@ bool encodeFast(CaptureSlot *slot, const YuvConvert::Source &src, const YuvConve
 
     // Every band that is going to be used has been read out of the capture. A
     // follower that missed the deadline (or a trial band) may still be reading
-    // it, but only to produce output nobody will use - and the memory itself
-    // stays valid until shutdown, which joins every worker first.
+    // it, but only to produce output nobody will use: the hook may refill the
+    // slot under it (garbage in, garbage discarded) but will not free the image
+    // while the follower is registered as a reader of it.
     ScreenCapture::ReleaseFrame(slot);
 
     if (!allDone) {

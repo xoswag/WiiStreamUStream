@@ -133,6 +133,12 @@ bool ensureSurface(CaptureSlot &slot, uint32_t width, uint32_t height) {
     // stricter alignment than the existing block was allocated with, and shape
     // changes happen about once per stream, so there is nothing to optimise.
     if (cb.surface.image != nullptr) {
+        if (__atomic_load_n(&slot.cpuReaders, __ATOMIC_ACQUIRE) != 0) {
+            // An encoder worker that fell behind is still reading the old image.
+            // Freeing it under that read is the one thing that must not happen;
+            // skipping this frame and trying again on the next is free.
+            return false;
+        }
         waitForSlotGpu(slot);
         MEMFreeToMappedMemory(cb.surface.image);
     }
@@ -402,6 +408,20 @@ void ScreenCapture::ReleaseFrame(CaptureSlot *slot) {
     msg.message = (void *) FRAME_MESSAGE;
     msg.args[0] = (uint32_t) slot;
     OSSendMessage(&sFreeQueue, &msg, OS_MESSAGE_FLAGS_NONE);
+}
+
+uint32_t ScreenCapture::SlotIndex(const CaptureSlot *slot) {
+    return (uint32_t) (slot - sSlots);
+}
+
+void ScreenCapture::BeginCpuRead(CaptureSlot *slot) {
+    __atomic_add_fetch(&slot->cpuReaders, 1, __ATOMIC_ACQ_REL);
+}
+
+void ScreenCapture::EndCpuRead(uint32_t slotIndex) {
+    if (slotIndex < CAPTURE_SLOT_COUNT) {
+        __atomic_sub_fetch(&sSlots[slotIndex].cpuReaders, 1, __ATOMIC_ACQ_REL);
+    }
 }
 
 void ScreenCapture::SignalStop() {

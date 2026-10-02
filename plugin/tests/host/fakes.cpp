@@ -186,6 +186,13 @@ void captureTeardown() {
             printf("FAKE-CAPTURE: slot %d still held by the encoder at teardown\n", i);
             sErrors++;
         }
+        const int32_t readers = __atomic_load_n(&sSlots[i].cpuReaders, __ATOMIC_ACQUIRE);
+        if (readers != 0) {
+            printf("FAKE-CAPTURE: slot %d has %d CPU reader(s) registered at teardown - the hook "
+                   "would never be allowed to resize it again\n",
+                   i, readers);
+            sErrors++;
+        }
         free(sSlots[i].colorBuffer.surface.image);
         sSlots[i].colorBuffer.surface.image = nullptr;
     }
@@ -294,6 +301,37 @@ void ScreenCapture::SignalStop() {
     std::lock_guard<std::mutex> l(sMutex);
     sReady.push_back(-1);
     sCv.notify_all();
+}
+
+uint32_t ScreenCapture::SlotIndex(const CaptureSlot *slot) {
+    const int idx = slotIndex(slot);
+    if (idx < 0) {
+        printf("FAKE-CAPTURE: SlotIndex of an unknown slot\n");
+        sErrors++;
+        return 0;
+    }
+    return (uint32_t) idx;
+}
+
+void ScreenCapture::BeginCpuRead(CaptureSlot *slot) {
+    if (slotIndex(slot) < 0) {
+        printf("FAKE-CAPTURE: BeginCpuRead on an unknown slot\n");
+        sErrors++;
+        return;
+    }
+    __atomic_add_fetch(&slot->cpuReaders, 1, __ATOMIC_ACQ_REL);
+}
+
+void ScreenCapture::EndCpuRead(uint32_t idx) {
+    if (idx >= CAPTURE_SLOT_COUNT) {
+        printf("FAKE-CAPTURE: EndCpuRead with slot index %u\n", idx);
+        sErrors++;
+        return;
+    }
+    if (__atomic_sub_fetch(&sSlots[idx].cpuReaders, 1, __ATOMIC_ACQ_REL) < 0) {
+        printf("FAKE-CAPTURE: EndCpuRead on slot %u without a matching BeginCpuRead\n", idx);
+        sErrors++;
+    }
 }
 
 uint32_t ScreenCapture::GetPresentedCount() {

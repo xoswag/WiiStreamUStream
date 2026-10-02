@@ -43,6 +43,15 @@ struct CaptureSlot {
      * pass this through ScreenCapture::WaitForGpu() before reading the image.
      */
     OSTime gpuTimestamp;
+    /**
+     * Encoder worker threads that may still be reading colorBuffer's image.
+     * The leader gives a slot back as soon as the bands it is going to *use*
+     * are done; a worker that missed the frame's deadline can still be reading
+     * it (its output is discarded). That is harmless while the image memory
+     * stays put, so the hook refuses to free it for a resize while this is
+     * non-zero. Touched with __atomic builtins only.
+     */
+    int32_t cpuReaders;
 };
 
 /** How many frames may be in flight between the GX2 hook and the encoder. */
@@ -82,6 +91,15 @@ public:
 
     /** Hands a slot back so the hook can fill it again. */
     static void ReleaseFrame(CaptureSlot *slot);
+
+    /**
+     * Registers a worker thread that is about to read the slot's image, and
+     * unregisters it when done. The index form exists because a worker learns
+     * which slot it was reading from a 32-bit message argument.
+     */
+    static uint32_t SlotIndex(const CaptureSlot *slot);
+    static void BeginCpuRead(CaptureSlot *slot);
+    static void EndCpuRead(uint32_t slotIndex);
 
     /** Wakes WaitForFrame() so the encoder thread can exit. */
     static void SignalStop();

@@ -244,6 +244,13 @@ bool Open(uint32_t clientIp) {
     sSocket       = fd;
 
     OSFastMutex_Unlock(&sMutex);
+
+    // A frame left waiting from the previous session belongs to a stream that is
+    // over - possibly a different title at a different size. Drop it, so the
+    // first thing the new client sees is a frame of what is on screen now.
+    OSFastMutex_Lock(&sPendingMutex);
+    sPendingValid = false;
+    OSFastMutex_Unlock(&sPendingMutex);
     DEBUG_FUNCTION_LINE("Streaming to %u.%u.%u.%u:%d",
                         (clientIp >> 24) & 0xFF, (clientIp >> 16) & 0xFF,
                         (clientIp >> 8) & 0xFF, clientIp & 0xFF, STREAM_UDP_PORT);
