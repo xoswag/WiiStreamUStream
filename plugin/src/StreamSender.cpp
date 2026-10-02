@@ -20,11 +20,15 @@
 #include "utils/logger.h"
 
 #include <arpa/inet.h> // htons
+#include <coreinit/cache.h>
 #include <coreinit/fastmutex.h>
+#include <coreinit/messagequeue.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
 #include <errno.h>
+#include <malloc.h>
 #include <netinet/in.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -38,15 +42,42 @@
 namespace StreamSender {
 namespace {
 
-OSFastMutex sMutex;
+OSFastMutex sMutex;      // the socket, and everything a send touches
+OSFastMutex sStatsMutex; // the counters below that are wider than 32 bits
 
 int sSocket = -1;
 uint32_t sFrameId = 0;
-uint32_t sSendFailures = 0;
-uint32_t sFramesSent = 0;
-uint64_t sBytesSent = 0;     // frame payload only
-uint64_t sWireBytesSent = 0; // payload + headers actually put on the socket
+uint32_t sSendFailures = 0;  // __atomic
+uint32_t sFramesSent = 0;    // sStatsMutex
+uint64_t sBytesSent = 0;     // sStatsMutex; frame payload only
+uint64_t sWireBytesSent = 0; // sStatsMutex; payload + headers actually put on the socket
 crc32_t sCrc;
+
+// --- sender thread state ---
+constexpr uint32_t SENDER_STACK_SIZE = 0x10000;
+constexpr int WAKE_QUEUE_SIZE        = 4;
+
+OSThread *sSenderThread = nullptr;
+void *sSenderStack      = nullptr;
+OSMessageQueue sWakeQueue;
+OSMessage sWakeMessages[WAKE_QUEUE_SIZE];
+volatile bool sSenderStop = false;
+
+// The pending slot, written by Submit() (encoder thread) and taken by the sender.
+OSFastMutex sPendingMutex;
+uint8_t *sPendingBuf  = nullptr;
+uint32_t sPendingCap  = 0;
+uint32_t sPendingSize = 0;
+FrameMeta sPendingMeta;
+bool sPendingValid = false;
+
+// Owned by the sender thread alone; swapped with the pending buffer under the lock.
+uint8_t *sSendingBuf = nullptr;
+uint32_t sSendingCap = 0;
+
+uint32_t sSubmitDrops = 0; // __atomic
+uint32_t sSendUsTotal = 0; // __atomic, wraps
+uint32_t sSendCount   = 0; // __atomic, wraps
 
 uint8_t sPacket[STREAM_HEADER_SIZE + STREAM_MAX_PAYLOAD];
 
@@ -105,10 +136,46 @@ bool sendDatagram(const uint8_t *data, uint32_t length, OSTime deadline) {
     return false;
 }
 
+int senderEntry(int /*argc*/, const char ** /*argv*/) {
+    for (;;) {
+        OSMessage msg;
+        OSReceiveMessage(&sWakeQueue, &msg, OS_MESSAGE_FLAGS_BLOCKING);
+        if (sSenderStop) {
+            break;
+        }
+
+        // Take the pending frame by swapping buffers, so the lock is held only for
+        // the swap and never for the send itself.
+        OSFastMutex_Lock(&sPendingMutex);
+        if (!sPendingValid) {
+            OSFastMutex_Unlock(&sPendingMutex);
+            continue;
+        }
+        uint8_t *const buf = sPendingBuf;
+        const uint32_t cap = sPendingCap;
+        sPendingBuf        = sSendingBuf;
+        sPendingCap        = sSendingCap;
+        sSendingBuf        = buf;
+        sSendingCap        = cap;
+        const uint32_t size  = sPendingSize;
+        const FrameMeta meta = sPendingMeta;
+        sPendingValid        = false;
+        OSFastMutex_Unlock(&sPendingMutex);
+
+        const OSTime t0 = OSGetSystemTime();
+        SendFrame(sSendingBuf, size, meta);
+        __atomic_add_fetch(&sSendUsTotal, (uint32_t) OSTicksToMicroseconds(OSGetSystemTime() - t0), __ATOMIC_RELAXED);
+        __atomic_add_fetch(&sSendCount, 1, __ATOMIC_RELAXED);
+    }
+    return 0;
+}
+
 } // namespace
 
 void InitOnce() {
     OSFastMutex_Init(&sMutex, "StreamSender");
+    OSFastMutex_Init(&sStatsMutex, "StreamSender stats");
+    OSFastMutex_Init(&sPendingMutex, "StreamSender pending");
 }
 
 bool Open(uint32_t clientIp) {
@@ -173,7 +240,7 @@ bool Open(uint32_t clientIp) {
     // frame ids as monotonic and ignores anything not newer than what it has
     // already completed, so restarting at 0 would make it discard every frame of
     // the new session until the counter climbed past the old one.
-    sSendFailures = 0;
+    __atomic_store_n(&sSendFailures, 0, __ATOMIC_RELAXED);
     sSocket       = fd;
 
     OSFastMutex_Unlock(&sMutex);
@@ -213,7 +280,8 @@ bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta) {
     const uint64_t timestampUs  = OSTicksToMicroseconds(OSGetSystemTime());
     const OSTime deadline       = OSGetSystemTime() + OSMillisecondsToTicks(FRAME_SEND_BUDGET_MS);
 
-    bool ok = true;
+    bool ok       = true;
+    uint64_t wire = 0;
     for (uint32_t offset = 0; offset < size;) {
         const uint32_t remaining = size - offset;
         const uint16_t chunkLen  = (uint16_t) (remaining > STREAM_MAX_PAYLOAD ? STREAM_MAX_PAYLOAD : remaining);
@@ -241,52 +309,178 @@ bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta) {
             // Abandon the rest of the frame. The client simply never completes
             // this frame id and moves on at the next one, so a partial send
             // costs one frame instead of desynchronising the stream.
-            sSendFailures++;
+            __atomic_add_fetch(&sSendFailures, 1, __ATOMIC_RELAXED);
             ok = false;
             break;
         }
         // Count only datagrams that actually reached the socket, so the bandwidth
         // figure reflects the wire and not what we intended to send.
-        sWireBytesSent += STREAM_HEADER_SIZE + chunkLen;
+        wire += STREAM_HEADER_SIZE + chunkLen;
 
         offset += chunkLen;
     }
 
+    OSFastMutex_Unlock(&sMutex);
+
+    // Statistics live under their own lock. sMutex is held for a whole frame's
+    // worth of IPC, and the encoder reads these every few seconds - it must not
+    // have to wait for a send to finish to do that.
+    OSFastMutex_Lock(&sStatsMutex);
+    sWireBytesSent += wire;
     if (ok) {
         sFramesSent++;
         sBytesSent += size;
     }
-
-    OSFastMutex_Unlock(&sMutex);
+    OSFastMutex_Unlock(&sStatsMutex);
     return ok;
 }
 
 uint32_t GetSendFailures() {
-    return sSendFailures;
+    return __atomic_load_n(&sSendFailures, __ATOMIC_RELAXED);
 }
 
 uint32_t GetFramesSent() {
-    OSFastMutex_Lock(&sMutex);
+    OSFastMutex_Lock(&sStatsMutex);
     const uint32_t v = sFramesSent;
-    OSFastMutex_Unlock(&sMutex);
+    OSFastMutex_Unlock(&sStatsMutex);
     return v;
 }
 
 uint64_t GetBytesSent() {
-    // Under the lock because a 64-bit load is two 32-bit loads on this PPC and
-    // SendFrame writes this counter; an unlocked read could tear mid-update and
-    // print a nonsense Mbit/s figure in the diagnostics.
-    OSFastMutex_Lock(&sMutex);
+    // Locked because a 64-bit load is two 32-bit loads on this PPC; an unlocked
+    // read could tear mid-update and print a nonsense Mbit/s figure.
+    OSFastMutex_Lock(&sStatsMutex);
     const uint64_t v = sBytesSent;
-    OSFastMutex_Unlock(&sMutex);
+    OSFastMutex_Unlock(&sStatsMutex);
     return v;
 }
 
 uint64_t GetWireBytesSent() {
-    OSFastMutex_Lock(&sMutex);
+    OSFastMutex_Lock(&sStatsMutex);
     const uint64_t v = sWireBytesSent;
-    OSFastMutex_Unlock(&sMutex);
+    OSFastMutex_Unlock(&sStatsMutex);
     return v;
+}
+
+uint32_t GetSubmitDrops() {
+    return __atomic_load_n(&sSubmitDrops, __ATOMIC_RELAXED);
+}
+
+uint32_t GetSendUsTotal() {
+    return __atomic_load_n(&sSendUsTotal, __ATOMIC_RELAXED);
+}
+
+uint32_t GetSendCount() {
+    return __atomic_load_n(&sSendCount, __ATOMIC_RELAXED);
+}
+
+// --- Sender thread ------------------------------------------------------------
+
+bool Submit(const uint8_t *payload, uint32_t size, const FrameMeta &meta) {
+    if (payload == nullptr || size == 0) {
+        return false;
+    }
+
+    OSFastMutex_Lock(&sPendingMutex);
+    if (sPendingCap < size) {
+        // Grow in 64 KB steps: frames vary a little in size from one to the next,
+        // and reallocating on every slightly-larger frame would be pointless churn.
+        const uint32_t cap = (size + 0xFFFF) & ~0xFFFFu;
+        auto *grown        = (uint8_t *) realloc(sPendingBuf, cap);
+        if (grown == nullptr) {
+            OSFastMutex_Unlock(&sPendingMutex);
+            DEBUG_FUNCTION_LINE_ERR("Failed to grow the send buffer to %u bytes", cap);
+            return false;
+        }
+        sPendingBuf = grown;
+        sPendingCap = cap;
+    }
+    if (sPendingValid) {
+        // Latest wins: the frame still waiting is now stale. Replacing it keeps
+        // latency flat when the link cannot keep up with the encoder.
+        __atomic_add_fetch(&sSubmitDrops, 1, __ATOMIC_RELAXED);
+    }
+    memcpy(sPendingBuf, payload, size);
+    sPendingSize  = size;
+    sPendingMeta  = meta;
+    sPendingValid = true;
+    OSFastMutex_Unlock(&sPendingMutex);
+
+    // A full queue just means a wake-up is already pending; the sender will pick
+    // up whatever is newest when it gets there.
+    OSMessage wake;
+    memset(&wake, 0, sizeof(wake));
+    OSSendMessage(&sWakeQueue, &wake, OS_MESSAGE_FLAGS_NONE);
+    return true;
+}
+
+bool StartThread(int core, int priority) {
+    if (sSenderThread != nullptr) {
+        return true;
+    }
+    if (core < 0 || core > 2) {
+        core = 0;
+    }
+
+    OSInitMessageQueue(&sWakeQueue, sWakeMessages, WAKE_QUEUE_SIZE);
+    sSenderStop = false;
+
+    sSenderThread = (OSThread *) memalign(8, sizeof(OSThread));
+    sSenderStack  = memalign(0x20, SENDER_STACK_SIZE);
+    if (sSenderThread == nullptr || sSenderStack == nullptr) {
+        free(sSenderThread);
+        free(sSenderStack);
+        sSenderThread = nullptr;
+        sSenderStack  = nullptr;
+        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the sender thread");
+        return false;
+    }
+    memset(sSenderThread, 0, sizeof(OSThread));
+
+    if (!OSCreateThread(sSenderThread, senderEntry, 0, nullptr,
+                        (char *) sSenderStack + SENDER_STACK_SIZE, SENDER_STACK_SIZE,
+                        priority, (OSThreadAttributes) (1 << core))) {
+        free(sSenderThread);
+        free(sSenderStack);
+        sSenderThread = nullptr;
+        sSenderStack  = nullptr;
+        DEBUG_FUNCTION_LINE_ERR("Failed to create the sender thread");
+        return false;
+    }
+    OSSetThreadName(sSenderThread, "WiiStreamUStream sender");
+    OSResumeThread(sSenderThread);
+    return true;
+}
+
+void StopThread() {
+    if (sSenderThread == nullptr) {
+        return;
+    }
+    sSenderStop = true;
+    OSMemoryBarrier();
+    // Blocking so the wake-up is guaranteed to arrive even if the queue is full;
+    // the sender is the one draining it.
+    OSMessage wake;
+    memset(&wake, 0, sizeof(wake));
+    OSSendMessage(&sWakeQueue, &wake, OS_MESSAGE_FLAGS_BLOCKING);
+
+    int result = 0;
+    OSJoinThread(sSenderThread, &result);
+    free(sSenderStack);
+    free(sSenderThread);
+    sSenderStack  = nullptr;
+    sSenderThread = nullptr;
+
+    OSFastMutex_Lock(&sPendingMutex);
+    free(sPendingBuf);
+    free(sSendingBuf);
+    sPendingBuf   = nullptr;
+    sSendingBuf   = nullptr;
+    sPendingCap   = 0;
+    sSendingCap   = 0;
+    sPendingSize  = 0;
+    sPendingValid = false;
+    OSFastMutex_Unlock(&sPendingMutex);
 }
 
 } // namespace StreamSender

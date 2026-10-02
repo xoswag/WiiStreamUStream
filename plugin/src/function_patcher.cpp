@@ -51,7 +51,14 @@ void captureIfEnabled(const GX2ColorBuffer *colorBuffer, GX2ScanTarget target) {
     // Register before re-checking the gate. Teardown clears the gate and then
     // waits for this counter, so this ordering is what guarantees a capture is
     // never running while the buffers are being freed.
+    //
+    // Each side stores one variable and then loads the other, which only works
+    // if neither store can be overtaken by the load after it. An acquire/release
+    // RMW does not promise that on PowerPC (lwsync/isync leave store->load
+    // reordering open); the full fence (a `sync`) does. Teardown has the same
+    // fence in StreamWaitForCapturesToFinish().
     __atomic_add_fetch(&gCaptureInFlight, 1, __ATOMIC_ACQ_REL);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     if (StreamingActive()) {
         ScreenCapture::CaptureFrame(colorBuffer, target);
     }

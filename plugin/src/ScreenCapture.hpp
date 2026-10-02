@@ -16,6 +16,7 @@
  ****************************************************************************/
 #pragma once
 
+#include <coreinit/time.h>
 #include <gx2/context.h>
 #include <gx2/enum.h>
 #include <gx2/surface.h>
@@ -36,6 +37,12 @@ struct CaptureSlot {
     void *resolveImage;       // scratch for the MSAA resolve path, allocated on demand
     uint32_t resolveCapacity;
     bool sourceIsSRGB;        // captured at submit time, see gTVSurfaceFormat
+    /**
+     * GPU timestamp that retires once the copy into colorBuffer has landed, or 0
+     * if the capture already waited for it (blocking GPU sync). The encoder must
+     * pass this through ScreenCapture::WaitForGpu() before reading the image.
+     */
+    OSTime gpuTimestamp;
 };
 
 /** How many frames may be in flight between the GX2 hook and the encoder. */
@@ -65,6 +72,13 @@ public:
      * Returns nullptr when the pipeline is shutting down.
      */
     static CaptureSlot *WaitForFrame();
+
+    /**
+     * Waits until the GPU has finished copying into the slot. Returns false on
+     * timeout, or if streaming stops while waiting - in which case the slot must
+     * be released without reading it.
+     */
+    static bool WaitForGpu(const CaptureSlot *slot, uint32_t timeoutMs);
 
     /** Hands a slot back so the hook can fill it again. */
     static void ReleaseFrame(CaptureSlot *slot);

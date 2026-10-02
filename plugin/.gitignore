@@ -1,2 +1,3 @@
 build/*
 *.mod
+tests/host/build/

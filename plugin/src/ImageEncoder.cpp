@@ -12,25 +12,58 @@
  * GNU General Public License for more details.
  ****************************************************************************/
 #include "ImageEncoder.hpp"
+#include "JpegStitch.hpp"
 #include "ScreenCapture.hpp"
 #include "StreamProtocol.h"
 #include "StreamSender.hpp"
+#include "YuvConvert.hpp"
 #include "retain_vars.hpp"
 #include "utils/logger.h"
 
 #include <coreinit/cache.h>
+#include <coreinit/messagequeue.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
 #include <malloc.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <turbojpeg.h>
 
+/*
+ * How a frame is encoded (FAST path)
+ * ----------------------------------
+ * One *leader* thread and up to two *followers*, each pinned to its own core.
+ *
+ *   leader:    take a captured frame -> wait for its GPU copy to land
+ *              -> hand each follower a band of the frame -> do the last band itself
+ *              -> wait for the followers -> splice the bands into one JPEG
+ *              -> give it to the sender thread
+ *   follower:  convert its band straight to YCbCr 4:2:0 -> compress it
+ *
+ * So the per-frame CPU work divides across however many cores are actually
+ * free. A follower whose core the game keeps busy is *benched* - noticed by it
+ * falling well behind the leader, or by it missing a frame's deadline - and is
+ * re-admitted only after it encodes a real band, on the side, about as fast as
+ * the leader does. Listing a contended core therefore never makes things much
+ * worse than leaving it out; it just stops helping.
+ *
+ * The SAFE path is the single-core RGB pipeline the earlier hardware
+ * measurements were taken on, kept as a one-menu-option fallback.
+ */
+
 namespace ImageEncoder {
 namespace {
 
-constexpr uint32_t THREAD_STACK_SIZE = 0x40000;
+constexpr int MAX_WORKERS = 3;
+
+constexpr uint32_t LEADER_STACK_SIZE   = 0x40000;
+constexpr uint32_t FOLLOWER_STACK_SIZE = 0x20000;
+
+// Below a typical game thread (~16; lower is more important on Cafe OS), so the
+// game always wins its own cores and the encoder only gets time it leaves idle.
+constexpr int WORKER_PRIORITY = 25;
 
 /**
  * 4:2:0, not upstream's 4:1:1. Both store a quarter of the chroma, but 4:2:0 is
@@ -39,130 +72,58 @@ constexpr uint32_t THREAD_STACK_SIZE = 0x40000;
  */
 constexpr int JPEG_SUBSAMPLING = TJSAMP_420;
 
-OSThread *sThread = nullptr;
-void *sThreadStack = nullptr;
-
-// Wall-clock spent in the CPU stages of a frame, summed since the last report
-// tick and divided by the frame count for the on-console diagnostics. sEncodeUs
-// is the whole path (cache invalidate + resample + JPEG); sCompressUs is just the
-// tjCompress2 call, so the two together say how much of the cost is the JPEG DCT
-// itself versus the surrounding memory work.
-uint64_t sEncodeUs = 0;
-uint64_t sCompressUs = 0;
-uint64_t sSendUs = 0;
-uint32_t sEncodeCount = 0;
+/** How long to wait for a capture's GPU copy before dropping the frame. */
+constexpr uint32_t GPU_WAIT_TIMEOUT_MS = 250;
+/** Consecutive GPU-wait timeouts after which async sync is abandoned for this title. */
+constexpr uint32_t GPU_FALLBACK_STREAK = 3;
 
 /**
- * A fixed amount of pure-register integer work, timed on the encoder thread once
- * per report window.
- *
- * The absolute figure is meaningless - what matters is the RATIO between a quiet
- * scene and a busy one. This thread runs at priority 25, so Cafe OS (strict
- * priority, no round-robin among equals) only schedules it when nothing more
- * important on its core is runnable. Every measurement we take around
- * tjCompress2 or send() is wall clock, so it silently includes time the thread
- * spent descheduled. Timing known work is the one way to see that dilation
- * directly, and it needs no OS API we would have to guess at.
+ * Once the leader has finished its own band it waits this much longer than its
+ * band took (or the floor, whichever is more) for the followers, then gives the
+ * frame up rather than let one stalled core hold the whole stream.
  */
-volatile uint32_t sCalibrationSink = 0;
+constexpr uint32_t FOLLOWER_WAIT_MIN_US = 12000;
+/** A follower slower per row than this multiple of the leader is benched... */
+constexpr uint32_t SLOW_RATIO_X10 = 18;
+/** ...after this many frames in a row of it. */
+constexpr uint32_t SLOW_STREAK = 2;
+/** A benched follower's trial band must come in under this multiple to rejoin. */
+constexpr uint32_t FIT_RATIO_X10 = 15;
+/** Trial bands for a benched follower are spaced this far apart, doubling (up to
+ *  the max) each time it is benched again soon after rejoining. */
+constexpr uint32_t PROBE_INTERVAL_MIN_MS = 1000;
+constexpr uint32_t PROBE_INTERVAL_MAX_MS = 8000;
+/** Rejoined for at least this long counts as settled: the interval resets. */
+constexpr uint32_t SETTLED_MS = 10000;
 
-uint32_t measureDilationUs() {
-    constexpr uint32_t ITERATIONS = 200000;
-    const OSTime start = OSGetSystemTime();
-    uint32_t x = 1;
-    for (uint32_t i = 0; i < ITERATIONS; i++) {
-        x = x * 3u + 1u;
-    }
-    sCalibrationSink = x; // keep the loop from being optimised away
-    return (uint32_t) OSTicksToMicroseconds(OSGetSystemTime() - start);
+enum : uint32_t {
+    MSG_BAND = 1,
+    MSG_STOP = 2,
+    MSG_DONE = 3,
+};
+
+inline uint32_t ticksToUs(OSTime t) {
+    return t > 0 ? (uint32_t) OSTicksToMicroseconds(t) : 0;
 }
 
-tjhandle sTjHandle = nullptr;
-
-uint8_t *sJpegBuffer = nullptr;
-unsigned long sJpegCapacity = 0;
-
-uint8_t *sScratchRGB = nullptr;
-uint32_t sScratchCapacity = 0;
-
-// Per-column source bounds for the downscale, rebuilt only when the width changes.
-uint32_t *sColStart = nullptr;
-uint32_t *sColEnd = nullptr;
-uint32_t sColCapacity = 0;
-
-uint8_t sSrgbLut[256];
-
-bool ensureColumnTable(uint32_t dstW) {
-    if (sColCapacity >= dstW && sColStart != nullptr && sColEnd != nullptr) {
-        return true;
-    }
-    free(sColStart);
-    free(sColEnd);
-    sColStart = (uint32_t *) malloc(dstW * sizeof(uint32_t));
-    sColEnd   = (uint32_t *) malloc(dstW * sizeof(uint32_t));
-    if (sColStart == nullptr || sColEnd == nullptr) {
-        free(sColStart);
-        free(sColEnd);
-        sColStart    = nullptr;
-        sColEnd      = nullptr;
-        sColCapacity = 0;
-        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the resample column table");
-        return false;
-    }
-    sColCapacity = dstW;
-    return true;
+inline uint32_t ticksToMs(OSTime t) {
+    return t > 0 ? (uint32_t) OSTicksToMilliseconds(t) : 0;
 }
 
-/**
- * (2^22)/n, so averaging a box becomes a multiply and a shift instead of a divide.
- *
- * Measured on hardware, the old resampler cost 166 cycles per output pixel and was
- * 47% of the whole frame time - more than the JPEG encode it feeds. Three integer
- * divides per pixel accounted for most of it: the PPC750's divider is ~19 cycles
- * and unpipelined, so it stalls everything behind it.
- *
- * 22 fractional bits, not 16: at 16 the reciprocal of a large box is quantised
- * badly enough to shift a channel by up to 14/255, which is a visible tint. 22
- * keeps the worst case within 1/255 of a true divide while the largest possible
- * product still sits comfortably inside 32 bits (~1.07e9 against a 4.29e9 limit).
- */
-constexpr uint32_t RECIP_SHIFT = 22;
-constexpr uint32_t RECIP_TABLE_SIZE = 1024;
-uint32_t *sRecip = nullptr;
-
-bool ensureRecipTable() {
-    if (sRecip != nullptr) {
-        return true;
+/** Nanoseconds per row, the unit cores are compared in. */
+inline uint32_t nsPerRow(uint32_t us, uint32_t rows) {
+    if (rows == 0) {
+        return 0;
     }
-    sRecip = (uint32_t *) malloc(RECIP_TABLE_SIZE * sizeof(uint32_t));
-    if (sRecip == nullptr) {
-        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the reciprocal table");
-        return false;
+    if (us > 4000000) {
+        us = 4000000; // keep the product inside 32 bits; anything this slow is benched anyway
     }
-    sRecip[0] = 0;
-    for (uint32_t i = 1; i < RECIP_TABLE_SIZE; i++) {
-        // Round up, so that a full-white box still averages to 255 rather than 254.
-        sRecip[i] = ((1u << RECIP_SHIFT) + i - 1) / i;
-    }
-    return true;
+    return us * 1000u / rows;
 }
 
-inline uint8_t averageChannel(uint32_t sum, uint32_t recip) {
-    const uint32_t v = (sum * recip) >> RECIP_SHIFT;
-    return (uint8_t) (v > 255 ? 255 : v);
-}
-
-void buildSrgbLut() {
-    for (int i = 0; i < 256; i++) {
-        const float v = (float) i / 255.0f;
-        const float s = (v <= 0.0031308f) ? (v * 12.92f)
-                                          : (1.055f * powf(v, 1.0f / 2.4f) - 0.055f);
-        int out = (int) (s * 255.0f + 0.5f);
-        if (out < 0) out = 0;
-        if (out > 255) out = 255;
-        sSrgbLut[i] = (uint8_t) out;
-    }
-}
+// =============================================================================
+// Shared: target size
+// =============================================================================
 
 /** Longest edge allowed for the configured capture size, 0 meaning "no limit". */
 void targetLimits(uint32_t &maxW, uint32_t &maxH) {
@@ -171,6 +132,7 @@ void targetLimits(uint32_t &maxW, uint32_t &maxH) {
         case WUPS_STREAMING_SIZE_480P: maxW = 854;  maxH = 480; break;
         case WUPS_STREAMING_SIZE_360P: maxW = 640;  maxH = 360; break;
         case WUPS_STREAMING_SIZE_240P: maxW = 426;  maxH = 240; break;
+        case WUPS_STREAMING_SIZE_180P: maxW = 320;  maxH = 180; break;
         case WUPS_STREAMING_SIZE_NATIVE:
         default:                       maxW = 0;    maxH = 0;   break;
     }
@@ -213,6 +175,120 @@ void computeTargetSize(uint32_t srcW, uint32_t srcH, uint32_t &dstW, uint32_t &d
     if (dstH > srcH) dstH = srcH;
 }
 
+#ifdef DEBUG
+/**
+ * A fixed amount of pure-register integer work, timed once per report window.
+ *
+ * The absolute figure is meaningless - what matters is the RATIO between a quiet
+ * scene and a busy one. Workers run at priority 25, so Cafe OS (strict priority,
+ * no round-robin among equals) only schedules them when nothing more important
+ * on the core is runnable, and every timing we take is wall clock. Timing known
+ * work is the one way to see that dilation directly.
+ */
+volatile uint32_t sCalibrationSink = 0;
+
+uint32_t measureDilationUs() {
+    constexpr uint32_t ITERATIONS = 200000;
+    const OSTime start = OSGetSystemTime();
+    uint32_t x         = 1;
+    for (uint32_t i = 0; i < ITERATIONS; i++) {
+        x = x * 3u + 1u;
+    }
+    sCalibrationSink = x; // keep the loop from being optimised away
+    return ticksToUs(OSGetSystemTime() - start);
+}
+#endif
+
+/** Splits encode cost into its parts for the diagnostics. */
+struct FrameTiming {
+    uint32_t convUs; // downscale + colour conversion (the leader's band, on FAST)
+    uint32_t jpegUs; // JPEG compression (the leader's band, on FAST)
+    uint32_t spliceUs;
+    uint32_t bands;
+    uint32_t frameTag; // FAST only: the tag the frame's bands were issued under
+};
+
+// =============================================================================
+// SAFE path: single core, RGB, libjpeg does the colour conversion. This is the
+// code from the last build the hardware measurements were taken on, unchanged
+// apart from now handing its frame to the sender thread.
+// =============================================================================
+
+tjhandle sTjLegacy = nullptr;
+
+uint8_t *sSafeJpeg         = nullptr;
+unsigned long sSafeJpegCap = 0;
+
+uint8_t *sScratchRGB      = nullptr;
+uint32_t sScratchCapacity = 0;
+
+// Per-column source bounds for the downscale, rebuilt only when the width changes.
+uint32_t *sColStart   = nullptr;
+uint32_t *sColEnd     = nullptr;
+uint32_t sColCapacity = 0;
+
+uint8_t sSrgbLut[256];
+
+/**
+ * (2^22)/n, so averaging a box becomes a multiply and a shift instead of a divide.
+ *
+ * Measured on hardware, the old resampler cost 166 cycles per output pixel and was
+ * 47% of the whole frame time - more than the JPEG encode it feeds. Three integer
+ * divides per pixel accounted for most of it: the PPC750's divider is ~19 cycles
+ * and unpipelined, so it stalls everything behind it.
+ *
+ * 22 fractional bits, not 16: at 16 the reciprocal of a large box is quantised
+ * badly enough to shift a channel by up to 14/255, which is a visible tint. 22
+ * keeps the worst case within 1/255 of a true divide while the largest possible
+ * product still sits comfortably inside 32 bits (~1.07e9 against a 4.29e9 limit).
+ */
+constexpr uint32_t RECIP_SHIFT      = 22;
+constexpr uint32_t RECIP_TABLE_SIZE = 1024;
+uint32_t sRecip[RECIP_TABLE_SIZE];
+
+void buildSafeTables() {
+    for (int i = 0; i < 256; i++) {
+        const float v = (float) i / 255.0f;
+        const float s = (v <= 0.0031308f) ? (v * 12.92f)
+                                          : (1.055f * powf(v, 1.0f / 2.4f) - 0.055f);
+        int out = (int) (s * 255.0f + 0.5f);
+        if (out < 0) out = 0;
+        if (out > 255) out = 255;
+        sSrgbLut[i] = (uint8_t) out;
+    }
+    sRecip[0] = 0;
+    for (uint32_t i = 1; i < RECIP_TABLE_SIZE; i++) {
+        // Round up, so that a full-white box still averages to 255 rather than 254.
+        sRecip[i] = ((1u << RECIP_SHIFT) + i - 1) / i;
+    }
+}
+
+inline uint8_t averageChannel(uint32_t sum, uint32_t recip) {
+    const uint32_t v = (sum * recip) >> RECIP_SHIFT;
+    return (uint8_t) (v > 255 ? 255 : v);
+}
+
+bool ensureColumnTable(uint32_t dstW) {
+    if (sColCapacity >= dstW && sColStart != nullptr && sColEnd != nullptr) {
+        return true;
+    }
+    free(sColStart);
+    free(sColEnd);
+    sColStart = (uint32_t *) malloc(dstW * sizeof(uint32_t));
+    sColEnd   = (uint32_t *) malloc(dstW * sizeof(uint32_t));
+    if (sColStart == nullptr || sColEnd == nullptr) {
+        free(sColStart);
+        free(sColEnd);
+        sColStart    = nullptr;
+        sColEnd      = nullptr;
+        sColCapacity = 0;
+        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the resample column table");
+        return false;
+    }
+    sColCapacity = dstW;
+    return true;
+}
+
 bool ensureScratch(uint32_t bytes) {
     if (sScratchCapacity >= bytes) {
         return true;
@@ -228,19 +304,19 @@ bool ensureScratch(uint32_t bytes) {
     return true;
 }
 
-bool ensureJpegBuffer(uint32_t w, uint32_t h) {
+bool ensureSafeJpeg(uint32_t w, uint32_t h) {
     const unsigned long needed = tjBufSize((int) w, (int) h, JPEG_SUBSAMPLING);
-    if (sJpegCapacity >= needed && sJpegBuffer != nullptr) {
+    if (sSafeJpegCap >= needed && sSafeJpeg != nullptr) {
         return true;
     }
-    tjFree(sJpegBuffer);
-    sJpegBuffer = (uint8_t *) tjAlloc((int) needed);
-    if (sJpegBuffer == nullptr) {
-        sJpegCapacity = 0;
+    tjFree(sSafeJpeg);
+    sSafeJpeg = (uint8_t *) tjAlloc((int) needed);
+    if (sSafeJpeg == nullptr) {
+        sSafeJpegCap = 0;
         DEBUG_FUNCTION_LINE_ERR("Failed to allocate %lu bytes for the JPEG buffer", needed);
         return false;
     }
-    sJpegCapacity = needed;
+    sSafeJpegCap = needed;
     return true;
 }
 
@@ -254,12 +330,7 @@ bool ensureJpegBuffer(uint32_t w, uint32_t h) {
  */
 bool resampleToRGB(const uint32_t *src, uint32_t srcPitchPx, uint32_t srcW, uint32_t srcH,
                    uint8_t *dst, uint32_t dstW, uint32_t dstH, bool applySrgb) {
-    // 1:1 - no averaging, no division at all. This is the path a 720p game on
-    // the default settings takes whenever colour correction is on, so it must
-    // not go anywhere near the general resampler below: that one does five
-    // integer divisions per output pixel, two of them 64-bit (and so libgcc
-    // calls, since PPC32 has no 64-bit divide), to compute sx0 = dx, sx1 = dx+1
-    // and n = 1.
+    // 1:1 - no averaging, no division at all.
     if (dstW == srcW && dstH == srcH) {
         for (uint32_t y = 0; y < dstH; y++) {
             const uint32_t *row = src + (size_t) y * srcPitchPx;
@@ -282,14 +353,8 @@ bool resampleToRGB(const uint32_t *src, uint32_t srcPitchPx, uint32_t srcW, uint
         return true;
     }
 
-    if (!ensureRecipTable()) {
-        return false;
-    }
-
-    // Exact integer ratio - the case worth special-casing, because 1280x720 -> 640x360
-    // is a clean 2:1 and every box is then the same size. The divisor is constant for
-    // the whole image, so it collapses to one shift (or one multiply) known up front,
-    // and the bounds arithmetic disappears entirely.
+    // Exact integer ratio - 1280x720 -> 640x360 is a clean 2:1 and every box is
+    // then the same size, so the divisor is constant for the whole image.
     if (srcW % dstW == 0 && srcH % dstH == 0) {
         const uint32_t bx = srcW / dstW;
         const uint32_t by = srcH / dstH;
@@ -347,9 +412,7 @@ bool resampleToRGB(const uint32_t *src, uint32_t srcPitchPx, uint32_t srcW, uint
         if (sy1 <= sy0) sy1 = sy0 + 1;
         if (sy1 > srcH) sy1 = srcH;
 
-        const uint32_t boxH = sy1 - sy0;
-        // Hoisted out of the pixel loop: the band's first row is fixed for this
-        // output row, so the per-pixel row-address multiply goes away.
+        const uint32_t boxH      = sy1 - sy0;
         const uint32_t *bandBase = src + (size_t) sy0 * srcPitchPx;
 
         for (uint32_t dx = 0; dx < dstW; dx++) {
@@ -395,340 +458,1002 @@ bool resampleToRGB(const uint32_t *src, uint32_t srcPitchPx, uint32_t srcW, uint
     return true;
 }
 
-void encodeAndSend(CaptureSlot *slot) {
-    const GX2Surface &surface = slot->colorBuffer.surface;
+/** The whole frame on the leader's core. */
+bool encodeSafe(const GX2Surface &surface, uint32_t dstW, uint32_t dstH, bool applySrgb, int quality,
+                const uint8_t *&payload, uint32_t &payloadSize, FrameTiming &timing) {
+    const OSTime start = OSGetSystemTime();
 
-    const uint32_t srcW     = surface.width;
-    const uint32_t srcH     = surface.height;
-    const uint32_t srcPitch = surface.pitch; // in pixels
-
-    if (surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || surface.image == nullptr) {
-        DEBUG_FUNCTION_LINE_ERR("Unexpected capture surface (format 0x%08X)", surface.format);
-        return;
-    }
-
-    // Time the whole CPU cost of the frame (cache invalidate + resample + JPEG
-    // compress) for the diagnostics. The network send is deliberately excluded.
-    const OSTime encodeStart = OSGetSystemTime();
-
-    // Invalidate on the core that is about to read. dcbi only affects the cache
-    // of the core executing it, so doing this in the GX2 hook (which runs on the
-    // game's render thread, on a different core) would not help this thread at
-    // all - and would put a 115k-block cache walk on the game's critical path.
+    // Invalidate on the core that is about to read: dcbi only affects the cache
+    // of the core executing it.
     DCInvalidateRange(surface.image, surface.imageSize);
 
-    uint32_t dstW, dstH;
-    computeTargetSize(srcW, srcH, dstW, dstH);
-
-    const bool applySrgb = (gColorMode == WUPS_STREAMING_COLOR_AUTO) && slot->sourceIsSRGB;
-    const bool needsPass = (dstW != srcW) || (dstH != srcH) || applySrgb;
-
-    if (!ensureJpegBuffer(dstW, dstH)) {
-        return;
+    if (!ensureSafeJpeg(dstW, dstH)) {
+        return false;
     }
 
+    const bool needsPass = (dstW != surface.width) || (dstH != surface.height) || applySrgb;
     const uint8_t *encodeSrc;
-    int encodePixelFormat;
-    int encodePitch;
-
+    int pixelFormat;
+    int pitch;
     if (needsPass) {
-        if (!ensureScratch(dstW * dstH * 3)) {
-            return;
-        }
-        if (!resampleToRGB((const uint32_t *) surface.image, srcPitch, srcW, srcH,
+        if (!ensureScratch(dstW * dstH * 3) ||
+            !resampleToRGB((const uint32_t *) surface.image, surface.pitch, surface.width, surface.height,
                            sScratchRGB, dstW, dstH, applySrgb)) {
-            return; // scratch is only partly written - encoding it would send garbage
+            return false; // scratch is only partly written - encoding it would send garbage
         }
-        encodeSrc         = sScratchRGB;
-        encodePixelFormat = TJPF_RGB;
-        encodePitch       = (int) (dstW * 3);
+        encodeSrc   = sScratchRGB;
+        pixelFormat = TJPF_RGB;
+        pitch       = (int) (dstW * 3);
     } else {
         // Nothing to correct and nothing to resize: hand the captured surface
-        // straight to the encoder. This is the 720p-native path and it is the
-        // reason 720p is affordable at all.
-        encodeSrc         = (const uint8_t *) surface.image;
-        encodePixelFormat = TJPF_RGBA;
-        encodePitch       = (int) (srcPitch * 4);
+        // straight to the encoder.
+        encodeSrc   = (const uint8_t *) surface.image;
+        pixelFormat = TJPF_RGBA;
+        pitch       = (int) (surface.pitch * 4);
     }
 
-    int quality = gQuality;
-    if (quality < STREAM_QUALITY_MIN) quality = STREAM_QUALITY_MIN;
-    if (quality > STREAM_QUALITY_MAX) quality = STREAM_QUALITY_MAX;
-
-    unsigned long jpegSize = sJpegCapacity;
-    unsigned char *jpegBuf = sJpegBuffer;
-
-    // TJFLAG_NOREALLOC keeps turbojpeg from allocating per frame; TJFLAG_FASTDCT
-    // is worth a lot here because the Espresso has no AltiVec, so libjpeg-turbo
-    // runs its plain-C path and the DCT dominates.
     const OSTime compressStart = OSGetSystemTime();
-    const int rc = tjCompress2(sTjHandle, encodeSrc, (int) dstW, encodePitch, (int) dstH,
-                               encodePixelFormat, &jpegBuf, &jpegSize,
-                               JPEG_SUBSAMPLING, quality,
-                               TJFLAG_NOREALLOC | TJFLAG_FASTDCT);
-    if (rc != 0) {
+    unsigned long jpegSize     = sSafeJpegCap;
+    unsigned char *jpegBuf     = sSafeJpeg;
+    if (tjCompress2(sTjLegacy, encodeSrc, (int) dstW, pitch, (int) dstH, pixelFormat, &jpegBuf, &jpegSize,
+                    JPEG_SUBSAMPLING, quality, TJFLAG_NOREALLOC | TJFLAG_FASTDCT) != 0) {
         DEBUG_FUNCTION_LINE_ERR("tjCompress2 failed: %s", tjGetErrorStr());
+        return false;
+    }
+    const OSTime done = OSGetSystemTime();
+
+    timing.convUs = ticksToUs(compressStart - start);
+    timing.jpegUs = ticksToUs(done - compressStart);
+    payload       = sSafeJpeg;
+    payloadSize   = (uint32_t) jpegSize;
+    return true;
+}
+
+// =============================================================================
+// FAST path
+// =============================================================================
+
+/** Everything a worker needs to know about the frame it is helping with. */
+struct FrameJob {
+    YuvConvert::Source src;
+    YuvConvert::Target dst;
+    int quality;
+    uint32_t bandH;    // height of every band but the last (a multiple of 16)
+    uint32_t numBands;
+};
+
+// Jobs live in a small ring, each stamped with the tag of the work it belongs
+// to, and a follower copies its job out when it picks it up. A follower whose
+// core the game has taken can sit on a message for a long time - hundreds of
+// milliseconds were measured on a starved core - and by the time it runs, the
+// leader may be rewriting that same ring entry for a newer frame. The tag is
+// cleared before such a rewrite and set after it, so a follower that reads the
+// same tag before and after its copy knows the copy is whole and current; any
+// other outcome means the work is stale, and it skips it.
+constexpr uint32_t JOB_RING = 8;
+FrameJob sJobs[JOB_RING];
+volatile uint32_t sJobTags[JOB_RING];
+
+constexpr int JOB_QUEUE_SIZE  = 4;
+constexpr int DONE_QUEUE_SIZE = 16;
+
+struct Worker {
+    int index        = 0;
+    int core         = 0;
+    OSThread *thread = nullptr;
+    void *stack      = nullptr;
+    tjhandle tj      = nullptr;
+
+    // The band this worker last produced. Written by the worker before it posts
+    // its completion, read by the leader only after receiving that completion.
+    uint8_t *jpeg       = nullptr;
+    size_t jpegCap      = 0;
+    size_t jpegSize     = 0;
+    bool lastOk         = false;
+    uint32_t lastRows   = 0;
+    uint32_t lastConvUs = 0;
+    uint32_t lastJpegUs = 0;
+    uint32_t lastBandUs = 0;
+    OSTime lastDoneAt   = 0;
+
+    uint8_t *yuv    = nullptr;
+    uint32_t yuvCap = 0;
+    YuvConvert::Scratch scratch;
+
+    // Followers only.
+    OSMessageQueue jobQueue;
+    OSMessage jobMessages[JOB_QUEUE_SIZE];
+
+    // Leader-side bookkeeping, only ever touched by the leader thread.
+    bool benched             = true;
+    bool busy                = false;
+    bool probing             = false; // the outstanding band is a trial, not part of a frame
+    uint32_t outstandingTag  = 0;
+    uint32_t completedTag    = 0;
+    OSTime dispatchedAt      = 0;
+    OSTime lastProbeAt       = 0;
+    OSTime unbenchedAt       = 0;
+    uint32_t probeIntervalMs = PROBE_INTERVAL_MIN_MS;
+    uint32_t slowStreak      = 0;
+    uint32_t lastLatencyUs   = 0; // dispatch to done, as the leader experiences it
+    uint32_t lastProbeUs     = 0;
+};
+
+Worker sWorkers[MAX_WORKERS];
+int sWorkerCount = 0;
+
+OSMessageQueue sDoneQueue;
+OSMessage sDoneMessages[DONE_QUEUE_SIZE];
+
+// Leader only.
+uint32_t sTagCounter     = 0;
+uint32_t sLeaderNsPerRow = 0; // smoothed; what a trial band is measured against
+uint8_t *sSpliceBuf      = nullptr;
+uint32_t sSpliceCap      = 0;
+
+uint32_t nextTag() {
+    if (++sTagCounter == 0) {
+        ++sTagCounter; // 0 marks a ring entry that is being rewritten
+    }
+    return sTagCounter;
+}
+
+void publishJob(uint32_t tag, const FrameJob &job) {
+    const uint32_t i = tag % JOB_RING;
+    sJobTags[i]      = 0;
+    OSMemoryBarrier();
+    sJobs[i] = job;
+    OSMemoryBarrier();
+    sJobTags[i] = tag;
+    OSMemoryBarrier();
+}
+
+bool readJob(uint32_t tag, FrameJob &job) {
+    const uint32_t i = tag % JOB_RING;
+    if (sJobTags[i] != tag) {
+        return false;
+    }
+    OSMemoryBarrier();
+    job = sJobs[i];
+    OSMemoryBarrier();
+    return sJobTags[i] == tag;
+}
+
+bool ensureYuv(Worker &w, uint32_t bytes) {
+    if (w.yuvCap >= bytes && w.yuv != nullptr) {
+        return true;
+    }
+    free(w.yuv);
+    w.yuv = (uint8_t *) memalign(0x40, bytes);
+    if (w.yuv == nullptr) {
+        w.yuvCap = 0;
+        DEBUG_FUNCTION_LINE_ERR("Worker %d: failed to allocate %u bytes of YCbCr planes", w.index, bytes);
+        return false;
+    }
+    w.yuvCap = bytes;
+    return true;
+}
+
+bool ensureBandJpeg(Worker &w, size_t bytes) {
+    if (w.jpegCap >= bytes && w.jpeg != nullptr) {
+        return true;
+    }
+    tj3Free(w.jpeg);
+    w.jpeg = (uint8_t *) tj3Alloc(bytes);
+    if (w.jpeg == nullptr) {
+        w.jpegCap = 0;
+        DEBUG_FUNCTION_LINE_ERR("Worker %d: failed to allocate %u bytes for a JPEG band", w.index, (uint32_t) bytes);
+        return false;
+    }
+    w.jpegCap = bytes;
+    return true;
+}
+
+bool ensureSplice(uint32_t bytes) {
+    if (sSpliceCap >= bytes && sSpliceBuf != nullptr) {
+        return true;
+    }
+    const uint32_t cap = (bytes + 0xFFFF) & ~0xFFFFu;
+    auto *grown        = (uint8_t *) realloc(sSpliceBuf, cap);
+    if (grown == nullptr) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to grow the splice buffer to %u bytes", cap);
+        return false;
+    }
+    sSpliceBuf = grown;
+    sSpliceCap = cap;
+    return true;
+}
+
+/**
+ * Converts and compresses band `band` of `job` on the calling worker's core.
+ */
+bool doBand(Worker &w, const FrameJob &job, uint32_t band) {
+    if (band >= job.numBands) {
+        return false;
+    }
+    const uint32_t y0 = band * job.bandH;
+    const uint32_t y1 = (band + 1 == job.numBands) ? job.dst.height : y0 + job.bandH;
+    if (y0 >= y1 || y1 > job.dst.height) {
+        return false;
+    }
+    const uint32_t rows = y1 - y0;
+    w.lastRows          = rows;
+    const OSTime t0     = OSGetSystemTime();
+
+    // Invalidate exactly the source rows this band reads, on the core about to
+    // read them - dcbi works on the executing core's cache.
+    uint32_t sy0, sy1;
+    YuvConvert::SourceRows(job.src, job.dst, y0, y1, sy0, sy1);
+    DCInvalidateRange((void *) (job.src.pixels + (size_t) sy0 * job.src.pitchPx),
+                      (sy1 - sy0) * job.src.pitchPx * 4);
+
+    if (!ensureYuv(w, YuvConvert::BandBytes(job.dst.width, rows))) {
+        return false;
+    }
+    const YuvConvert::BandPlanes planes = YuvConvert::LayoutBand(w.yuv, job.dst.width, rows);
+    if (!YuvConvert::ConvertBand(job.src, job.dst, y0, y1, planes, w.scratch)) {
+        return false;
+    }
+    const OSTime t1 = OSGetSystemTime();
+
+    const size_t need = tj3JPEGBufSize((int) job.dst.width, (int) rows, JPEG_SUBSAMPLING);
+    if (need == 0 || !ensureBandJpeg(w, need)) {
+        return false;
+    }
+    tj3Set(w.tj, TJPARAM_QUALITY, job.quality);
+
+    const unsigned char *srcPlanes[3] = {planes.y, planes.cb, planes.cr};
+    const int strides[3]              = {(int) planes.strideY, (int) planes.strideC, (int) planes.strideC};
+    unsigned char *out                = w.jpeg;
+    size_t outSize                    = w.jpegCap;
+    if (tj3CompressFromYUVPlanes8(w.tj, srcPlanes, (int) job.dst.width, strides, (int) rows, &out, &outSize) != 0) {
+        DEBUG_FUNCTION_LINE_ERR("Worker %d: tj3CompressFromYUVPlanes8 failed: %s", w.index, tj3GetErrorStr(w.tj));
+        return false;
+    }
+    if (out != w.jpeg) {
+        // TJPARAM_NOREALLOC rules this out, but if the library ever did hand back
+        // a different buffer it now owns that one - adopt it rather than leak it.
+        w.jpeg    = out;
+        w.jpegCap = outSize;
+    }
+    w.jpegSize = outSize;
+
+    const OSTime t2 = OSGetSystemTime();
+    w.lastConvUs    = ticksToUs(t1 - t0);
+    w.lastJpegUs    = ticksToUs(t2 - t1);
+    w.lastBandUs    = ticksToUs(t2 - t0);
+    return true;
+}
+
+int followerEntry(int argc, const char ** /*argv*/) {
+    Worker &w = sWorkers[argc];
+    for (;;) {
+        OSMessage msg;
+        OSReceiveMessage(&w.jobQueue, &msg, OS_MESSAGE_FLAGS_BLOCKING);
+        if ((uint32_t) (uintptr_t) msg.message == MSG_STOP) {
+            break;
+        }
+
+        const uint32_t tag = msg.args[0];
+        w.lastOk           = false;
+        w.lastRows         = 0;
+        FrameJob job;
+        if (readJob(tag, job)) {
+            w.lastOk = doBand(w, job, msg.args[1]);
+        }
+        w.lastDoneAt = OSGetSystemTime();
+        OSMemoryBarrier();
+
+        OSMessage done;
+        memset(&done, 0, sizeof(done));
+        done.message = (void *) (uintptr_t) MSG_DONE;
+        done.args[0] = (uint32_t) w.index;
+        done.args[1] = tag;
+        OSSendMessage(&sDoneQueue, &done, OS_MESSAGE_FLAGS_BLOCKING);
+    }
+    return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Leader-side follower management
+// -----------------------------------------------------------------------------
+
+void bench(Worker &w, const char *why, OSTime now) {
+    if (!w.benched) {
+        // Benched again soon after earning its place back: the core is busy on
+        // and off, so wait longer before the next trial.
+        if (w.unbenchedAt != 0 && ticksToMs(now - w.unbenchedAt) < SETTLED_MS) {
+            w.probeIntervalMs = w.probeIntervalMs * 2 > PROBE_INTERVAL_MAX_MS ? PROBE_INTERVAL_MAX_MS
+                                                                              : w.probeIntervalMs * 2;
+        } else {
+            w.probeIntervalMs = PROBE_INTERVAL_MIN_MS;
+        }
+        DEBUG_FUNCTION_LINE("Benching core %d: %s (next trial in %u ms)", w.core, why, w.probeIntervalMs);
+    }
+    w.benched     = true;
+    w.slowStreak  = 0;
+    w.lastProbeAt = now;
+}
+
+/** Applies one completion message to the bookkeeping of the worker it came from. */
+void onDone(const OSMessage &msg) {
+    const uint32_t idx = msg.args[0];
+    if (idx == 0 || idx >= (uint32_t) sWorkerCount) {
+        return;
+    }
+    Worker &w          = sWorkers[idx];
+    const uint32_t tag = msg.args[1];
+    if (!w.busy || tag != w.outstandingTag) {
+        return; // stale - already accounted for
+    }
+    w.busy          = false;
+    w.completedTag  = tag;
+    w.lastLatencyUs = ticksToUs(w.lastDoneAt - w.dispatchedAt);
+
+    if (w.probing) {
+        w.probing         = false;
+        w.lastProbeUs     = w.lastLatencyUs;
+        const uint32_t ns = nsPerRow(w.lastLatencyUs, w.lastRows);
+        if (w.benched && w.lastOk && ns > 0 && sLeaderNsPerRow > 0 &&
+            (uint64_t) ns * 10 <= (uint64_t) sLeaderNsPerRow * FIT_RATIO_X10) {
+            w.benched     = false;
+            w.slowStreak  = 0;
+            w.unbenchedAt = OSGetSystemTime();
+            DEBUG_FUNCTION_LINE("Core %d rejoins: trial band at %u ns/row vs leader %u ns/row",
+                                w.core, ns, sLeaderNsPerRow);
+        }
+    }
+}
+
+void drainDone() {
+    OSMessage msg;
+    while (OSReceiveMessage(&sDoneQueue, &msg, OS_MESSAGE_FLAGS_NONE)) {
+        onDone(msg);
+    }
+}
+
+bool dispatch(Worker &w, uint32_t tag, uint32_t band, OSTime now, bool probe) {
+    OSMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.message = (void *) (uintptr_t) MSG_BAND;
+    msg.args[0] = tag;
+    msg.args[1] = band;
+    if (!OSSendMessage(&w.jobQueue, &msg, OS_MESSAGE_FLAGS_NONE)) {
+        return false;
+    }
+    w.outstandingTag = tag;
+    w.busy           = true;
+    w.probing        = probe;
+    w.dispatchedAt   = now;
+    return true;
+}
+
+/**
+ * Bands of equal height (a multiple of 16, so each is a whole number of JPEG
+ * MCU rows) for every band but the last, which takes the remainder. Collapses
+ * the count when the image is too short to give everyone a band.
+ */
+uint32_t layoutBands(uint32_t height, uint32_t &count) {
+    if (count <= 1 || height < 32) {
+        count = 1;
+        return height;
+    }
+    uint32_t bh = (((height + count - 1) / count) + 15) & ~15u;
+    while (count > 1 && (count - 1) * bh >= height) {
+        count--;
+        bh = (((height + count - 1) / count) + 15) & ~15u;
+    }
+    return (count == 1) ? height : bh;
+}
+
+/**
+ * Encodes one frame across the leader and every follower in play. Always
+ * releases the slot, as early as it safely can.
+ */
+bool encodeFast(CaptureSlot *slot, const YuvConvert::Source &src, const YuvConvert::Target &dst, int quality,
+                const uint8_t *&payload, uint32_t &payloadSize, FrameTiming &timing) {
+    Worker &leader   = sWorkers[0];
+    const OSTime now = OSGetSystemTime();
+
+    Worker *helpers[MAX_WORKERS];
+    uint32_t helperCount = 0;
+    for (int i = 1; i < sWorkerCount; i++) {
+        if (!sWorkers[i].benched && !sWorkers[i].busy) {
+            helpers[helperCount++] = &sWorkers[i];
+        }
+    }
+
+    uint32_t numBands    = helperCount + 1;
+    const uint32_t bandH = layoutBands(dst.height, numBands);
+    helperCount          = numBands - 1;
+
+    const uint32_t tag = nextTag();
+    const FrameJob job = {src, dst, quality, bandH, numBands};
+    publishJob(tag, job);
+    timing.frameTag = tag;
+
+    // Followers take the full-height bands; the leader takes the last one, the
+    // remainder, because it also has the splice to do.
+    for (uint32_t i = 0; i < helperCount; i++) {
+        if (!dispatch(*helpers[i], tag, i, now, false)) {
+            // A follower that is not busy has an empty queue, so this cannot
+            // happen - but if it did, that band would never be encoded. Bands
+            // already handed out finish on their own and are simply not used.
+            ScreenCapture::ReleaseFrame(slot);
+            return false;
+        }
+    }
+
+    // A benched follower that is due a trial gets a real band of this frame to
+    // encode on the side. Nothing waits for it: its only output is how long it
+    // took, which is the honest test of whether its core has room again.
+    uint32_t probeTag = 0;
+    for (int i = 1; i < sWorkerCount; i++) {
+        Worker &w = sWorkers[i];
+        if (!w.benched || w.busy) {
+            continue;
+        }
+        if (w.lastProbeAt != 0 && ticksToMs(now - w.lastProbeAt) < w.probeIntervalMs) {
+            continue; // not due yet (a follower that has never had a trial is due at once)
+        }
+        if (probeTag == 0) {
+            uint32_t trialBands   = 2;
+            const uint32_t trialH = layoutBands(dst.height, trialBands);
+            if (trialBands < 2) {
+                break; // image too short to split - nothing to gain from helpers anyway
+            }
+            probeTag = nextTag();
+            publishJob(probeTag, FrameJob{src, dst, quality, trialH, trialBands});
+        }
+        if (dispatch(w, probeTag, 0, now, true)) {
+            w.lastProbeAt = now;
+        }
+    }
+
+    const bool leaderOk     = doBand(leader, job, numBands - 1);
+    const OSTime leaderDone = OSGetSystemTime();
+    const uint32_t leaderNs = nsPerRow(leader.lastBandUs, leader.lastRows);
+    if (leaderOk && leaderNs > 0) {
+        sLeaderNsPerRow = sLeaderNsPerRow == 0 ? leaderNs
+                                               : (uint32_t) (((uint64_t) sLeaderNsPerRow * 3 + leaderNs) / 4);
+    }
+
+    uint32_t waitUs = leader.lastBandUs * 2;
+    if (waitUs < FOLLOWER_WAIT_MIN_US) waitUs = FOLLOWER_WAIT_MIN_US;
+    const OSTime deadline = leaderDone + (OSTime) OSMicrosecondsToTicks(waitUs);
+
+    bool allDone;
+    for (;;) {
+        drainDone();
+        allDone = true;
+        for (uint32_t i = 0; i < helperCount; i++) {
+            if (helpers[i]->busy || helpers[i]->completedTag != tag) {
+                allDone = false;
+                break;
+            }
+        }
+        if (allDone || OSGetSystemTime() >= deadline) {
+            break;
+        }
+        OSSleepTicks(OSMicrosecondsToTicks(100));
+    }
+
+    // Every band that is going to be used has been read out of the capture. A
+    // follower that missed the deadline (or a trial band) may still be reading
+    // it, but only to produce output nobody will use - and the memory itself
+    // stays valid until shutdown, which joins every worker first.
+    ScreenCapture::ReleaseFrame(slot);
+
+    if (!allDone) {
+        const OSTime t = OSGetSystemTime();
+        for (uint32_t i = 0; i < helperCount; i++) {
+            Worker &w = *helpers[i];
+            if (w.busy || w.completedTag != tag) {
+                bench(w, "missed the frame deadline", t);
+            }
+        }
+        return false;
+    }
+
+    // A follower that keeps costing much more per row than the leader is making
+    // frames slower, not faster. Latency (dispatch to done) is the measure, since
+    // time spent waiting to be scheduled delays the frame just the same.
+    bool bandsOk = leaderOk;
+    for (uint32_t i = 0; i < helperCount; i++) {
+        Worker &w         = *helpers[i];
+        bandsOk           = bandsOk && w.lastOk;
+        const uint32_t ns = nsPerRow(w.lastLatencyUs, w.lastRows);
+        if (leaderNs > 0 && w.lastLatencyUs > 4000 && (uint64_t) ns * 10 > (uint64_t) leaderNs * SLOW_RATIO_X10) {
+            if (++w.slowStreak >= SLOW_STREAK) {
+                bench(w, "consistently slower than the leader", OSGetSystemTime());
+            }
+        } else {
+            w.slowStreak = 0;
+        }
+    }
+    if (!bandsOk) {
+        return false;
+    }
+
+    timing.convUs = leader.lastConvUs;
+    timing.jpegUs = leader.lastJpegUs;
+    timing.bands  = numBands;
+
+    if (numBands == 1) {
+        timing.spliceUs = 0;
+        payload         = leader.jpeg;
+        payloadSize     = (uint32_t) leader.jpegSize;
+        return true;
+    }
+
+    const OSTime spliceStart = OSGetSystemTime();
+    const uint8_t *bands[JpegStitch::MAX_BANDS];
+    uint32_t sizes[JpegStitch::MAX_BANDS];
+    for (uint32_t i = 0; i < helperCount; i++) {
+        bands[i] = helpers[i]->jpeg;
+        sizes[i] = (uint32_t) helpers[i]->jpegSize;
+    }
+    bands[numBands - 1] = leader.jpeg;
+    sizes[numBands - 1] = (uint32_t) leader.jpegSize;
+
+    const uint32_t need = JpegStitch::SplicedSize(bands, sizes, numBands);
+    uint32_t spliced    = 0;
+    if (need == 0 || !ensureSplice(need) ||
+        !JpegStitch::Splice(bands, sizes, numBands, dst.width, dst.height, bandH, sSpliceBuf, sSpliceCap, spliced)) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to splice %u bands", numBands);
+        return false;
+    }
+    timing.spliceUs = ticksToUs(OSGetSystemTime() - spliceStart);
+    payload         = sSpliceBuf;
+    payloadSize     = spliced;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Reporting (debug builds only)
+// -----------------------------------------------------------------------------
+
+#ifdef DEBUG
+struct ReportWindow {
+    OSTime start;
+    uint32_t frames;
+    uint32_t dropped;
+    uint32_t gpuTimeouts;
+    uint64_t frameUs, gpuUs, convUs, jpegUs, spliceUs;
+    uint64_t bands;
+    uint64_t followerUs[MAX_WORKERS];
+    uint32_t followerBands[MAX_WORKERS];
+    uint32_t lastW, lastH;
+    // Baselines for counters owned by other modules.
+    uint32_t framesSent;
+    uint64_t bytesSent;
+    uint64_t wireSent;
+    uint32_t submitDrops;
+    uint32_t sendUs;
+    uint32_t sendCount;
+};
+
+void resetWindow(ReportWindow &r) {
+    memset(&r, 0, sizeof(r));
+    r.start       = OSGetTime();
+    r.framesSent  = StreamSender::GetFramesSent();
+    r.bytesSent   = StreamSender::GetBytesSent();
+    r.wireSent    = StreamSender::GetWireBytesSent();
+    r.submitDrops = StreamSender::GetSubmitDrops();
+    r.sendUs      = StreamSender::GetSendUsTotal();
+    r.sendCount   = StreamSender::GetSendCount();
+    ScreenCapture::ResetCounters();
+}
+
+#define MS2(us) (uint32_t) ((us) / 1000), (uint32_t) (((us) % 1000) / 10)
+
+void report(ReportWindow &r) {
+    // Millisecond window, not floored whole seconds: dividing by an integer 5
+    // when the window ran 5.4 s inflates every rate, worst when frames are sparse.
+    const uint32_t elapsedMs = ticksToMs(OSGetTime() - r.start);
+    if (elapsedMs < 5000) {
         return;
     }
 
-    const OSTime doneTime = OSGetSystemTime();
-    sCompressUs += OSTicksToMicroseconds(doneTime - compressStart);
-    sEncodeUs += OSTicksToMicroseconds(doneTime - encodeStart);
-    sEncodeCount++;
+    // Snapshot every counter once so the lines below agree with each other.
+    const uint32_t presented  = ScreenCapture::GetPresentedCount();
+    const uint32_t captured   = ScreenCapture::GetCapturedCount();
+    const uint32_t encBusy    = ScreenCapture::GetSkippedCount();
+    const uint32_t framesSent = StreamSender::GetFramesSent() - r.framesSent;
+    const uint64_t bytesSent  = StreamSender::GetBytesSent() - r.bytesSent;
+    const uint64_t wireSent   = StreamSender::GetWireBytesSent() - r.wireSent;
+    const uint32_t replaced   = StreamSender::GetSubmitDrops() - r.submitDrops;
+    const uint32_t sendUs     = StreamSender::GetSendUsTotal() - r.sendUs;
+    const uint32_t sendCount  = StreamSender::GetSendCount() - r.sendCount;
 
-    const StreamSender::FrameMeta meta = {
-            .width           = (uint16_t) dstW,
-            .height          = (uint16_t) dstH,
-            .stride          = 0, // JPEG carries its own dimensions
-            .compressionType = STREAM_COMP_JPEG,
-            .pixelFormat     = STREAM_PIXFMT_JPEG,
-    };
+    auto perSec      = [elapsedMs](uint64_t count) { return (uint32_t) (count * 1000 / elapsedMs); };
+    const uint32_t f = r.frames ? r.frames : 1;
 
-    // Timed separately from the encode. Working back from the reported bitrate
-    // showed 30-50% of every frame's wall time was being spent here and going
-    // completely unmeasured: a 720p frame is ~93 datagrams and each send() is a
-    // blocking IPC round trip to IOSU. Encode and send are serialised on this one
-    // thread, so this cost is directly in the frame-rate path.
-    const OSTime sendStart = OSGetSystemTime();
-    StreamSender::SendFrame(sJpegBuffer, (uint32_t) jpegSize, meta);
-    sSendUs += OSTicksToMicroseconds(OSGetSystemTime() - sendStart);
+    const uint64_t avgFrame  = r.frameUs / f;
+    const uint64_t avgGpu    = r.gpuUs / f;
+    const uint64_t avgConv   = r.convUs / f;
+    const uint64_t avgJpeg   = r.jpegUs / f;
+    const uint64_t avgSplice = r.spliceUs / f;
+    const uint64_t avgSend   = sendCount ? sendUs / sendCount : 0;
+    const uint32_t avgKB     = framesSent ? (uint32_t) (bytesSent / framesSent / 1024) : 0;
+    // Application-layer throughput (payload + 44-byte header); true link use is
+    // ~5-8% higher once UDP/IP/Ethernet framing is added.
+    const uint32_t mbitx100 = (uint32_t) ((wireSent * 800ull) / (elapsedMs * 1000ull));
+    const uint32_t bandsx10 = (uint32_t) (r.bands * 10 / f);
+
+    // present is the ceiling (the game's own present rate). enc-busy is frames the
+    // encoder had no free slot for: the CPU-bottleneck signal. send-replaced is
+    // frames the sender had not got to before a newer one replaced them: the
+    // network-bottleneck signal.
+    DEBUG_FUNCTION_LINE("[fps] present %u | capture %u | encode %u | tx %u   "
+                        "(enc-busy %u/s, dropped %u, gpu-timeouts %u, send-replaced %u, sendfail %u total)",
+                        perSec(presented), perSec(captured), perSec(r.frames), perSec(framesSent),
+                        perSec(encBusy), r.dropped, r.gpuTimeouts, replaced, StreamSender::GetSendFailures());
+    DEBUG_FUNCTION_LINE("[cost] frame %u.%02u ms (gpu wait %u.%02u, lead band: convert %u.%02u + jpeg %u.%02u, "
+                        "splice %u.%02u) | send %u.%02u ms | %u.%02u Mbit/s | %u KB | %ux%u",
+                        MS2(avgFrame), MS2(avgGpu), MS2(avgConv), MS2(avgJpeg), MS2(avgSplice), MS2(avgSend),
+                        mbitx100 / 100, mbitx100 % 100, avgKB, r.lastW, r.lastH);
+
+    char cores[192];
+    int n = snprintf(cores, sizeof(cores), "%s, %u.%u bands/frame |",
+                     gEncodePath == WUPS_STREAMING_PATH_SAFE ? "SAFE" : "FAST", bandsx10 / 10, bandsx10 % 10);
+    for (int i = 0; i < sWorkerCount && n > 0 && n < (int) sizeof(cores); i++) {
+        const Worker &w = sWorkers[i];
+        if (i == 0) {
+            n += snprintf(cores + n, sizeof(cores) - n, " core%d leads", w.core);
+        } else if (w.benched) {
+            n += snprintf(cores + n, sizeof(cores) - n, " core%d benched (trial %u.%02u ms)", w.core,
+                          MS2(w.lastProbeUs));
+        } else if (r.followerBands[i] == 0) {
+            n += snprintf(cores + n, sizeof(cores) - n, " core%d idle", w.core);
+        } else {
+            const uint64_t avg = r.followerUs[i] / r.followerBands[i];
+            n += snprintf(cores + n, sizeof(cores) - n, " core%d %u.%02u ms/band", w.core, MS2(avg));
+        }
+    }
+    // cpu-check: fixed work timed on the leader. If it doubles when the scene
+    // gets busy, the leader's core is being shared with the game.
+    DEBUG_FUNCTION_LINE("[cores] %s | cpu-check %u us%s", cores, measureDilationUs(),
+                        UseBlockingGpuSync() ? " | GPU sync BLOCKING" : "");
+
+    resetWindow(r);
 }
+#endif // DEBUG
 
-int threadEntry(int /*argc*/, const char ** /*argv*/) {
-    DEBUG_FUNCTION_LINE("Encoder thread running");
+// -----------------------------------------------------------------------------
+// Leader thread
+// -----------------------------------------------------------------------------
 
-    OSTime lastReport = OSGetTime();
-    uint32_t lastFramesSent   = StreamSender::GetFramesSent();
-    uint64_t lastBytesSent    = StreamSender::GetBytesSent();
-    uint64_t lastWireBytesSent = StreamSender::GetWireBytesSent();
+int leaderEntry(int /*argc*/, const char ** /*argv*/) {
+    DEBUG_FUNCTION_LINE("Encoder running: %d core(s), leader on core %d", sWorkerCount, sWorkers[0].core);
+
+    uint32_t gpuStreak = 0;
+#ifdef DEBUG
+    ReportWindow window;
     bool windowAnchored = false;
-    (void) lastFramesSent; // only read by the DEBUG-only log below
-    (void) lastBytesSent;
-    (void) lastWireBytesSent;
+#endif
 
-    // The stop sentinel is the *only* exit. Checking sShouldExit here as well
-    // would let a thread that was mid-encode when Stop() was called leave the
-    // sentinel sitting in the queue, where the next encoder thread would pop it
-    // and die immediately - which is exactly what changing "Encoder core" from
-    // the config menu does.
+    // The stop sentinel from ScreenCapture::SignalStop() is the *only* exit.
+    // Checking a flag here as well would let a thread that was mid-frame when
+    // Stop() was called leave the sentinel in the queue, where the next encoder
+    // would pop it and die immediately.
     for (;;) {
         CaptureSlot *slot = ScreenCapture::WaitForFrame();
         if (slot == nullptr) {
             break;
         }
 
+#ifdef DEBUG
         if (!windowAnchored) {
-            // Anchor the very first measurement window to the first frame of the
-            // stream. The encoder thread is created at title launch but frames only
-            // flow once a client connects, seconds-to-minutes later; without this the
-            // first report would divide a whole window of idle time by a handful of
-            // frames and read near-zero. It also discards any counts left over from a
-            // previous run of this thread (an "Encoder core" change stops and restarts
-            // it), so the first report is never a blend of two sessions.
+            // Measure from the first frame, not from thread creation, which can
+            // be minutes before a client connects.
             windowAnchored = true;
-            ScreenCapture::ResetCounters();
-            sEncodeUs         = 0;
-            sCompressUs       = 0;
-            sEncodeCount      = 0;
-            lastFramesSent    = StreamSender::GetFramesSent();
-            lastBytesSent     = StreamSender::GetBytesSent();
-            lastWireBytesSent = StreamSender::GetWireBytesSent();
-            lastReport        = OSGetTime();
+            resetWindow(window);
+        }
+#endif
+
+        const OSTime frameStart = OSGetSystemTime();
+        drainDone();
+
+        if (!ScreenCapture::WaitForGpu(slot, GPU_WAIT_TIMEOUT_MS)) {
+            ScreenCapture::ReleaseFrame(slot);
+            if (StreamingActive()) {
+#ifdef DEBUG
+                window.gpuTimeouts++;
+#endif
+                if (++gpuStreak >= GPU_FALLBACK_STREAK && !gGpuSyncFallback) {
+                    gGpuSyncFallback = true;
+                    OSMemoryBarrier();
+                    DEBUG_FUNCTION_LINE_WARN("GPU copies are not retiring in time; "
+                                             "falling back to blocking GPU sync for this title");
+                }
+            }
+            continue;
+        }
+        gpuStreak            = 0;
+        const OSTime gpuDone = OSGetSystemTime();
+
+        const GX2Surface &surface = slot->colorBuffer.surface;
+        if (surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || surface.image == nullptr) {
+            DEBUG_FUNCTION_LINE_ERR("Unexpected capture surface (format 0x%08X)", surface.format);
+            ScreenCapture::ReleaseFrame(slot);
+            continue;
         }
 
-        encodeAndSend(slot);
-        ScreenCapture::ReleaseFrame(slot);
+        uint32_t dstW, dstH;
+        computeTargetSize(surface.width, surface.height, dstW, dstH);
+        const bool applySrgb = (gColorMode == WUPS_STREAMING_COLOR_AUTO) && slot->sourceIsSRGB;
+        int quality          = gQuality;
+        if (quality < STREAM_QUALITY_MIN) quality = STREAM_QUALITY_MIN;
+        if (quality > STREAM_QUALITY_MAX) quality = STREAM_QUALITY_MAX;
 
-        const OSTime now = OSGetTime();
-        // Millisecond window, not floored whole seconds: dividing counts by an
-        // integer 5 when the window actually ran 5.4 s inflates every rate, and the
-        // inflation is worst exactly when frames are sparse (720p) - the regime the
-        // measurement is meant to characterise.
-        const uint32_t elapsedMs = (uint32_t) OSTicksToMilliseconds(now - lastReport);
-        if (elapsedMs >= 5000) {
-            // Snapshot every counter once, so the two log lines below are consistent
-            // with each other and the divisions cannot see a mid-update value.
-            const uint32_t presented  = ScreenCapture::GetPresentedCount();
-            const uint32_t captured   = ScreenCapture::GetCapturedCount();
-            const uint32_t encBusy    = ScreenCapture::GetSkippedCount();
-            const uint32_t encodeCnt  = sEncodeCount;
-            const uint32_t framesSent = StreamSender::GetFramesSent() - lastFramesSent;
-            const uint64_t bytesSent  = StreamSender::GetBytesSent() - lastBytesSent;
-            const uint64_t wireSent   = StreamSender::GetWireBytesSent() - lastWireBytesSent;
+        const uint8_t *payload = nullptr;
+        uint32_t payloadSize   = 0;
+        FrameTiming timing     = {0, 0, 0, 1, 0};
+        bool ok;
 
-            const uint32_t avgEncodeUs = encodeCnt ? (uint32_t) (sEncodeUs / encodeCnt) : 0;
-            const uint32_t avgJpegUs   = encodeCnt ? (uint32_t) (sCompressUs / encodeCnt) : 0;
-            const uint32_t avgSendUs   = encodeCnt ? (uint32_t) (sSendUs / encodeCnt) : 0;
-            const uint32_t avgBytes    = framesSent ? (uint32_t) (bytesSent / framesSent) : 0;
-            const uint32_t dilationUs  = measureDilationUs();
-
-            // Rates over the real window. present is the ceiling (game present rate);
-            // encBusy is the honest "encoder could not take the frame, no free slot"
-            // count - the CPU-bottleneck signal. present - capture is NOT that signal,
-            // because frame-skip drops frames on purpose before the slot check.
-            const uint32_t presentFps = (uint32_t) ((uint64_t) presented * 1000 / elapsedMs);
-            const uint32_t captureFps = (uint32_t) ((uint64_t) captured * 1000 / elapsedMs);
-            const uint32_t encodeFps  = (uint32_t) ((uint64_t) encodeCnt * 1000 / elapsedMs);
-            const uint32_t txFps      = (uint32_t) ((uint64_t) framesSent * 1000 / elapsedMs);
-            const uint32_t encBusyPerS = (uint32_t) ((uint64_t) encBusy * 1000 / elapsedMs);
-            // Application-layer throughput (payload + 44-byte header); true link use
-            // is ~5-8% higher once UDP/IP/Ethernet framing is added.
-            const uint32_t mbitx100   = (uint32_t) ((wireSent * 800ull) / (elapsedMs * 1000ull));
-
-            // Only read by the DEBUG_FUNCTION_LINE calls below, which compile to
-            // while(0) in a release build - void them so that build stays warning-clean.
-            (void) avgEncodeUs;
-            (void) avgJpegUs;
-            (void) avgSendUs;
-            (void) avgBytes;
-            (void) mbitx100;
-            (void) presentFps;
-            (void) captureFps;
-            (void) encodeFps;
-            (void) txFps;
-            (void) encBusyPerS;
-            (void) dilationUs;
-
-            DEBUG_FUNCTION_LINE("[fps] present %u | capture %u | encode %u | tx %u   (enc-busy %u/s, sendfail %u total)",
-                                presentFps, captureFps, encodeFps, txFps, encBusyPerS,
-                                StreamSender::GetSendFailures());
-            DEBUG_FUNCTION_LINE("[cost] encode %u.%02u ms (jpeg %u.%02u) | send %u.%02u ms | %u.%02u Mbit/s | avg %u KB/frame",
-                                avgEncodeUs / 1000, (avgEncodeUs % 1000) / 10,
-                                avgJpegUs / 1000, (avgJpegUs % 1000) / 10,
-                                avgSendUs / 1000, (avgSendUs % 1000) / 10,
-                                mbitx100 / 100, mbitx100 % 100, avgBytes / 1024);
-            // Compare this across runs: if it doubles when the scene gets busy, the
-            // encode/send figures above are inflated by that same factor and the
-            // real compute cost is correspondingly lower.
-            DEBUG_FUNCTION_LINE("[load] cpu-check %u us for fixed work (higher = this thread is being starved)",
-                                dilationUs);
-
-            sEncodeUs     = 0;
-            sCompressUs   = 0;
-            sSendUs       = 0;
-            sEncodeCount  = 0;
-            lastFramesSent    = StreamSender::GetFramesSent();
-            lastBytesSent     = StreamSender::GetBytesSent();
-            lastWireBytesSent = StreamSender::GetWireBytesSent();
-            lastReport    = now;
-            ScreenCapture::ResetCounters();
+        if (gEncodePath == WUPS_STREAMING_PATH_SAFE) {
+            ok = encodeSafe(surface, dstW, dstH, applySrgb, quality, payload, payloadSize, timing);
+            ScreenCapture::ReleaseFrame(slot);
+        } else {
+            const YuvConvert::Source src = {(const uint32_t *) surface.image, surface.pitch, surface.width, surface.height};
+            const YuvConvert::Target dst = {dstW, dstH, applySrgb};
+            ok = encodeFast(slot, src, dst, quality, payload, payloadSize, timing);
         }
+
+        if (ok) {
+            const StreamSender::FrameMeta meta = {
+                    .width           = (uint16_t) dstW,
+                    .height          = (uint16_t) dstH,
+                    .stride          = 0, // JPEG carries its own dimensions
+                    .compressionType = STREAM_COMP_JPEG,
+                    .pixelFormat     = STREAM_PIXFMT_JPEG,
+            };
+            ok = StreamSender::Submit(payload, payloadSize, meta);
+        }
+
+#ifdef DEBUG
+        if (ok) {
+            window.frames++;
+            window.frameUs += ticksToUs(OSGetSystemTime() - frameStart);
+            window.gpuUs += ticksToUs(gpuDone - frameStart);
+            window.convUs += timing.convUs;
+            window.jpegUs += timing.jpegUs;
+            window.spliceUs += timing.spliceUs;
+            window.bands += timing.bands;
+            window.lastW = dstW;
+            window.lastH = dstH;
+            if (timing.bands > 1) {
+                for (int i = 1; i < sWorkerCount; i++) {
+                    const Worker &w = sWorkers[i];
+                    if (!w.busy && w.completedTag == timing.frameTag) {
+                        window.followerUs[i] += w.lastLatencyUs;
+                        window.followerBands[i]++;
+                    }
+                }
+            }
+        } else {
+            window.dropped++;
+        }
+        report(window);
+#else
+        (void) frameStart;
+        (void) gpuDone;
+#endif
     }
 
-    DEBUG_FUNCTION_LINE("Encoder thread stopping");
+    DEBUG_FUNCTION_LINE("Encoder stopping");
     return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Lifecycle
+// -----------------------------------------------------------------------------
+
+/** Cores to use, leader first, for an "Encoder cores" setting. */
+int coresForPreset(int32_t preset, int *cores) {
+    switch (preset) {
+        case WUPS_STREAMING_CORES_0:
+            cores[0] = 0;
+            return 1;
+        case WUPS_STREAMING_CORES_2:
+            cores[0] = 2;
+            return 1;
+        case WUPS_STREAMING_CORES_1:
+            cores[0] = 1;
+            return 1;
+        case WUPS_STREAMING_CORES_ALL:
+            // Core 1 runs most games' main thread, so it goes last: it is the one
+            // most likely to spend its time benched.
+            cores[0] = 0;
+            cores[1] = 2;
+            cores[2] = 1;
+            return 3;
+        case WUPS_STREAMING_CORES_0_2:
+        default:
+            cores[0] = 0;
+            cores[1] = 2;
+            return 2;
+    }
+}
+
+void freeWorker(Worker &w) {
+    free(w.stack);
+    free(w.thread);
+    if (w.tj != nullptr) {
+        tj3Destroy(w.tj);
+    }
+    tj3Free(w.jpeg);
+    free(w.yuv);
+    YuvConvert::FreeScratch(w.scratch);
+    w = Worker{};
+}
+
+bool createWorkerThread(Worker &w, OSThreadEntryPointFn entry, uint32_t stackSize, const char *name) {
+    w.thread = (OSThread *) memalign(8, sizeof(OSThread));
+    w.stack  = memalign(0x20, stackSize);
+    if (w.thread == nullptr || w.stack == nullptr) {
+        free(w.thread);
+        free(w.stack);
+        w.thread = nullptr;
+        w.stack  = nullptr;
+        return false;
+    }
+    memset(w.thread, 0, sizeof(OSThread));
+    if (!OSCreateThread(w.thread, entry, w.index, nullptr, (char *) w.stack + stackSize, stackSize,
+                        WORKER_PRIORITY, (OSThreadAttributes) (1 << w.core))) {
+        free(w.thread);
+        free(w.stack);
+        w.thread = nullptr;
+        w.stack  = nullptr;
+        return false;
+    }
+    OSSetThreadName(w.thread, name);
+    OSResumeThread(w.thread);
+    return true;
 }
 
 } // namespace
 
 bool Start() {
-    if (sThread != nullptr) {
+    if (sWorkerCount > 0) {
         return true;
     }
 
-    buildSrgbLut();
+    buildSafeTables();
+    YuvConvert::Init();
+    OSInitMessageQueue(&sDoneQueue, sDoneMessages, DONE_QUEUE_SIZE);
+    for (uint32_t i = 0; i < JOB_RING; i++) {
+        sJobTags[i] = 0;
+    }
+    sTagCounter     = 0;
+    sLeaderNsPerRow = 0;
 
-    // Set up the compressor here rather than inside the thread. If it failed in
-    // the thread body, the thread would exit before reaching its loop while
-    // sThread stayed non-null - so IsRunning() would claim a live encoder, and a
-    // later Stop() would push a stop sentinel that nobody consumes, killing the
-    // *next* encoder thread on its first wait.
-    sTjHandle = tjInitCompress();
-    if (sTjHandle == nullptr) {
+    // Set up every compressor here rather than inside the threads, so a failure
+    // leaves no half-started encoder behind.
+    sTjLegacy = tjInitCompress();
+    if (sTjLegacy == nullptr) {
         DEBUG_FUNCTION_LINE_ERR("tjInitCompress failed: %s", tjGetErrorStr());
         return false;
     }
 
-    sThread = (OSThread *) memalign(8, sizeof(OSThread));
-    if (sThread == nullptr) {
-        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the encoder thread");
-        tjDestroy(sTjHandle);
-        sTjHandle = nullptr;
+    int cores[MAX_WORKERS];
+    const int count = coresForPreset(gEncoderCores, cores);
+    for (int i = 0; i < count; i++) {
+        Worker &w = sWorkers[i];
+        w         = Worker{};
+        w.index   = i;
+        w.core    = cores[i];
+        // Followers start benched and earn their place with a trial band, so the
+        // first frames never wait on a core the game turns out to be using.
+        w.benched = (i != 0);
+        w.tj      = tj3Init(TJINIT_COMPRESS);
+        if (w.tj == nullptr) {
+            DEBUG_FUNCTION_LINE_ERR("tj3Init failed for worker %d", i);
+            for (int j = 0; j <= i; j++) {
+                freeWorker(sWorkers[j]);
+            }
+            tjDestroy(sTjLegacy);
+            sTjLegacy = nullptr;
+            return false;
+        }
+        // Identical settings on every worker are what make the bands splice: same
+        // quantisation tables, standard (non-optimised) Huffman tables, baseline,
+        // and no restart markers of their own.
+        tj3Set(w.tj, TJPARAM_SUBSAMP, JPEG_SUBSAMPLING);
+        tj3Set(w.tj, TJPARAM_FASTDCT, 1);
+        tj3Set(w.tj, TJPARAM_NOREALLOC, 1);
+        tj3Set(w.tj, TJPARAM_OPTIMIZE, 0);
+        tj3Set(w.tj, TJPARAM_PROGRESSIVE, 0);
+        tj3Set(w.tj, TJPARAM_ARITHMETIC, 0);
+        tj3Set(w.tj, TJPARAM_RESTARTBLOCKS, 0);
+        tj3Set(w.tj, TJPARAM_RESTARTROWS, 0);
+        if (i > 0) {
+            OSInitMessageQueue(&w.jobQueue, w.jobMessages, JOB_QUEUE_SIZE);
+        }
+    }
+    sWorkerCount = count;
+
+    // Followers first, so they are waiting by the time the leader hands out work.
+    for (int i = count - 1; i >= 1; i--) {
+        if (!createWorkerThread(sWorkers[i], followerEntry, FOLLOWER_STACK_SIZE, "WiiStreamUStream follower")) {
+            DEBUG_FUNCTION_LINE_ERR("Failed to start the follower on core %d", sWorkers[i].core);
+            Stop();
+            return false;
+        }
+    }
+    if (!createWorkerThread(sWorkers[0], leaderEntry, LEADER_STACK_SIZE, "WiiStreamUStream encoder")) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to start the encoder on core %d", sWorkers[0].core);
+        Stop();
         return false;
     }
-    memset(sThread, 0, sizeof(OSThread));
-
-    sThreadStack = memalign(0x20, THREAD_STACK_SIZE);
-    if (sThreadStack == nullptr) {
-        DEBUG_FUNCTION_LINE_ERR("Failed to allocate the encoder stack");
-        free(sThread);
-        sThread = nullptr;
-        tjDestroy(sTjHandle);
-        sTjHandle = nullptr;
-        return false;
-    }
-
-    int core = gEncoderCore;
-    if (core < 0 || core > 2) {
-        core = 2;
-    }
-    const uint8_t affinity = (uint8_t) (1 << core);
-
-    // Priority 25 sits below a typical game thread (~16), so the console stays
-    // playable and the encoder soaks up whatever is left.
-    if (!OSCreateThread(sThread, threadEntry, 0, nullptr,
-                        (char *) sThreadStack + THREAD_STACK_SIZE, THREAD_STACK_SIZE,
-                        25, (OSThreadAttributes) affinity)) {
-        DEBUG_FUNCTION_LINE_ERR("OSCreateThread failed");
-        free(sThreadStack);
-        free(sThread);
-        sThreadStack = nullptr;
-        sThread      = nullptr;
-        tjDestroy(sTjHandle);
-        sTjHandle = nullptr;
-        return false;
-    }
-
-    OSSetThreadName(sThread, "ScreenStreaming encoder");
-    OSResumeThread(sThread);
     return true;
 }
 
 void Stop() {
-    if (sThread == nullptr) {
+    if (sWorkerCount == 0) {
         return;
     }
 
-    ScreenCapture::SignalStop(); // the sentinel is what ends the loop
+    // The leader first: the stop sentinel ends its loop. Only send it if the
+    // leader actually exists - a sentinel nobody consumes would kill the *next*
+    // encoder on its first wait.
+    if (sWorkers[0].thread != nullptr) {
+        ScreenCapture::SignalStop();
+        int result = 0;
+        OSJoinThread(sWorkers[0].thread, &result);
+    }
 
-    int result = 0;
-    OSJoinThread(sThread, &result);
+    // Then the followers. One may still be finishing a band the leader gave up
+    // on; it completes, posts to the done queue (which always has room) and then
+    // reads the stop.
+    for (int i = 1; i < sWorkerCount; i++) {
+        Worker &w = sWorkers[i];
+        if (w.thread == nullptr) {
+            continue;
+        }
+        OSMessage msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.message = (void *) (uintptr_t) MSG_STOP;
+        OSSendMessage(&w.jobQueue, &msg, OS_MESSAGE_FLAGS_BLOCKING);
+        int result = 0;
+        OSJoinThread(w.thread, &result);
+    }
 
-    free(sThreadStack);
-    free(sThread);
-    sThreadStack = nullptr;
-    sThread      = nullptr;
+    // Only now is it safe to free what the threads were using.
+    for (int i = 0; i < sWorkerCount; i++) {
+        freeWorker(sWorkers[i]);
+    }
+    sWorkerCount = 0;
 
-    // Only safe once the thread is definitely gone.
-    tjDestroy(sTjHandle);
-    sTjHandle = nullptr;
+    OSMessage msg;
+    while (OSReceiveMessage(&sDoneQueue, &msg, OS_MESSAGE_FLAGS_NONE)) {
+    }
 
-    tjFree(sJpegBuffer);
-    sJpegBuffer   = nullptr;
-    sJpegCapacity = 0;
-
+    tjDestroy(sTjLegacy);
+    sTjLegacy = nullptr;
+    tjFree(sSafeJpeg);
+    sSafeJpeg    = nullptr;
+    sSafeJpegCap = 0;
     free(sScratchRGB);
     sScratchRGB      = nullptr;
     sScratchCapacity = 0;
-
     free(sColStart);
     free(sColEnd);
     sColStart    = nullptr;
     sColEnd      = nullptr;
     sColCapacity = 0;
-
-    free(sRecip);
-    sRecip = nullptr;
+    free(sSpliceBuf);
+    sSpliceBuf = nullptr;
+    sSpliceCap = 0;
 
     DEBUG_FUNCTION_LINE("Encoder stopped");
 }
 
 bool IsRunning() {
-    // Deliberately reports whether a thread is *owned*, not whether it has
-    // reached its loop yet. Start() tests the same thing, so the two predicates
-    // agree; using sRunning here made a dead-but-not-joined encoder look
-    // stopped to callers and started to Start().
-    return sThread != nullptr;
+    // Whether threads are *owned*, which is what Start() tests too, so the two
+    // agree even while a thread is starting up or winding down.
+    return sWorkerCount > 0;
 }
 
 } // namespace ImageEncoder

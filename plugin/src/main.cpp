@@ -37,6 +37,13 @@ WUPS_USE_STORAGE("wiistreamustream");
 
 namespace {
 
+// The sender sits on core 0 with the encoder's leader, one step above it in
+// priority so a finished frame goes out as soon as the leader moves on. Each
+// send() is a synchronous IPC to IOSU that mostly sleeps, so it takes little
+// from the encode.
+constexpr int SENDER_CORE     = 0;
+constexpr int SENDER_PRIORITY = 24;
+
 bool sPipelineRunning = false;
 
 void startPipeline() {
@@ -48,14 +55,21 @@ void startPipeline() {
         DEBUG_FUNCTION_LINE_ERR("Failed to set up the capture buffers");
         return;
     }
+    if (!StreamSender::StartThread(SENDER_CORE, SENDER_PRIORITY)) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to start the sender");
+        ScreenCapture::Shutdown();
+        return;
+    }
     if (!ImageEncoder::Start()) {
         DEBUG_FUNCTION_LINE_ERR("Failed to start the encoder");
+        StreamSender::StopThread();
         ScreenCapture::Shutdown();
         return;
     }
     if (!ControlServer::Start()) {
         DEBUG_FUNCTION_LINE_ERR("Failed to start the control server");
         ImageEncoder::Stop();
+        StreamSender::StopThread();
         ScreenCapture::Shutdown();
         return;
     }
@@ -84,6 +98,9 @@ void stopPipeline() {
 
     ControlServer::Stop();
     ImageEncoder::Stop();
+    // After the encoder (nothing can Submit any more), before the capture
+    // buffers go: the sender only ever touches its own copies of a frame.
+    StreamSender::StopThread();
     ScreenCapture::Shutdown();
 
     DEBUG_FUNCTION_LINE("Pipeline stopped");
@@ -107,6 +124,9 @@ ON_APPLICATION_START() {
 
     gHasForeground   = true;
     gClientConnected = false;
+    // Every title gets a fresh try at asynchronous GPU sync; a fallback the last
+    // one needed says nothing about this one.
+    gGpuSyncFallback = false;
     OSMemoryBarrier();
 
     startPipeline();

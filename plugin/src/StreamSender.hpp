@@ -62,9 +62,32 @@ bool SendFrame(const uint8_t *payload, uint32_t size, const FrameMeta &meta);
 
 uint32_t GetSendFailures();
 
+// --- Sender thread ------------------------------------------------------------
+//
+// Sending used to happen on the encoder thread, so every frame paid encode time
+// *plus* send time - measured at 20-50% of the frame on its own. A dedicated
+// thread lets the next frame encode while this one is on the wire. Each send()
+// is a synchronous IPC to IOSU that mostly sleeps, so the thread costs little CPU.
+//
+// Handoff is a single pending slot with latest-wins semantics: if the network
+// falls behind, the frame waiting to go out is replaced by a newer one rather
+// than queued, so latency can never build up.
+
+/** Starts the sender thread on the given core. Idempotent. */
+bool StartThread(int core, int priority);
+
+/** Stops and joins the sender thread, discarding any frame not yet sent. */
+void StopThread();
+
+/** Copies a finished frame into the pending slot and wakes the sender. */
+bool Submit(const uint8_t *payload, uint32_t size, const FrameMeta &meta);
+
 // --- Instrumentation. Monotonic counters, read on the encoder's report tick. --
 uint32_t GetFramesSent();
 uint64_t GetBytesSent();     // frame payload bytes only (for average KB/frame)
 uint64_t GetWireBytesSent(); // payload + 44-byte headers (for link bandwidth)
+uint32_t GetSubmitDrops();   // frames replaced in the pending slot before sending
+uint32_t GetSendUsTotal();   // wraps; take deltas
+uint32_t GetSendCount();     // wraps; take deltas
 
 } // namespace StreamSender

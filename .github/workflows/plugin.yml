@@ -60,6 +60,25 @@ jobs:
           JOB_STATUS: ${{ job.status }}
         run: bash ../.github/publish-log.sh build.log
 
+  # The encoder's threading, band splitting and JPEG splicing, run on the host
+  # against stubbed console APIs and a real libjpeg-turbo, under ASan/UBSan.
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the encoder host tests
+        shell: bash
+        run: bash tests/host/run.sh 2>&1 | tee build.log
+
+      - name: Publish the test log
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOG_BRANCH: ci-log/plugin-hosttest
+          JOB_STATUS: ${{ job.status }}
+        run: bash ../.github/publish-log.sh build.log
+
   build-debug:
     runs-on: ubuntu-latest
     steps:

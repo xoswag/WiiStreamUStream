@@ -21,8 +21,11 @@
 #include <coreinit/cache.h>
 #include <coreinit/memory.h>
 #include <coreinit/messagequeue.h>
+#include <coreinit/thread.h>
+#include <coreinit/time.h>
 #include <gx2/event.h>
 #include <gx2/mem.h>
+#include <gx2/state.h>
 #include <gx2/surface.h>
 #include <memory/mappedmemory.h>
 #include <string.h>
@@ -77,6 +80,36 @@ void freeSlotMemory(CaptureSlot &slot) {
 }
 
 /**
+ * Waits until the GPU has finished the last copy queued into this slot.
+ *
+ * With asynchronous GPU sync the encoder can hand a slot back before that copy
+ * has landed (it gives a frame up after a timeout), so the slot's memory may
+ * still have a GPU write pending when the hook takes it again. That is harmless
+ * while the memory stays put - the next copy is queued behind the old one - but
+ * freeing it would let the GPU write into memory that now belongs to someone
+ * else. Only needed when a slot's buffers are about to be replaced, which
+ * happens about once per stream, and always on the render thread, where waiting
+ * on GX2 is allowed.
+ */
+void waitForSlotGpu(CaptureSlot &slot) {
+    if (slot.gpuTimestamp != 0) {
+        GX2WaitTimeStamp(slot.gpuTimestamp);
+        slot.gpuTimestamp = 0;
+    }
+}
+
+/**
+ * Writes back any dirty cache lines a CPU left in freshly allocated GPU memory,
+ * once. If one were written back later it would land on top of what the GPU had
+ * copied in. Nothing on the CPU ever writes a capture buffer after this - the
+ * encoder only reads it - so once is enough, where the old path paid for a
+ * flush of the whole buffer on every frame.
+ */
+void flushOnce(void *image, uint32_t size) {
+    DCFlushRange(image, size);
+}
+
+/**
  * Shapes the destination surface and makes sure it owns enough memory.
  *
  * The destination is always the *same size as the source*. GX2CopySurface has
@@ -100,6 +133,7 @@ bool ensureSurface(CaptureSlot &slot, uint32_t width, uint32_t height) {
     // stricter alignment than the existing block was allocated with, and shape
     // changes happen about once per stream, so there is nothing to optimise.
     if (cb.surface.image != nullptr) {
+        waitForSlotGpu(slot);
         MEMFreeToMappedMemory(cb.surface.image);
     }
     slot.imageCapacity = 0;
@@ -139,6 +173,7 @@ bool ensureSurface(CaptureSlot &slot, uint32_t width, uint32_t height) {
     }
     sLoggedAllocFailureSize = 0;
     slot.imageCapacity      = cb.surface.imageSize;
+    flushOnce(cb.surface.image, cb.surface.imageSize);
     DEBUG_FUNCTION_LINE("Allocated a %ux%u capture buffer (%u bytes, pitch %u)",
                         width, height, cb.surface.imageSize, cb.surface.pitch);
 
@@ -152,6 +187,7 @@ bool resolveAA(CaptureSlot &slot, const GX2ColorBuffer *srcBuffer, GX2Surface &o
 
     if (slot.resolveCapacity < outSurface.imageSize) {
         if (slot.resolveImage != nullptr) {
+            waitForSlotGpu(slot);
             MEMFreeToMappedMemory(slot.resolveImage);
         }
         slot.resolveImage = MEMAllocFromMappedMemoryForGX2Ex(outSurface.imageSize, outSurface.alignment);
@@ -161,6 +197,7 @@ bool resolveAA(CaptureSlot &slot, const GX2ColorBuffer *srcBuffer, GX2Surface &o
             return false;
         }
         slot.resolveCapacity = outSurface.imageSize;
+        flushOnce(slot.resolveImage, slot.resolveCapacity);
     }
 
     outSurface.image = slot.resolveImage;
@@ -267,15 +304,35 @@ bool ScreenCapture::CaptureFrame(const GX2ColorBuffer *srcBuffer, GX2ScanTarget 
         }
 
         if (ok) {
-            GX2Invalidate(GX2_INVALIDATE_MODE_CPU, slot->colorBuffer.surface.image, slot->colorBuffer.surface.imageSize);
+            const bool blocking = UseBlockingGpuSync();
+            if (blocking) {
+                // The old capture path, kept exactly as it was as the fallback.
+                // The async path flushes once at allocation instead (see
+                // flushOnce): this is ~115k cache operations on the game's render
+                // thread for every 720p frame captured.
+                GX2Invalidate(GX2_INVALIDATE_MODE_CPU, slot->colorBuffer.surface.image, slot->colorBuffer.surface.imageSize);
+            }
 
             GX2CopySurface(source, srcMip, srcSlice, &slot->colorBuffer.surface, 0, 0);
 
             GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, slot->colorBuffer.surface.image, slot->colorBuffer.surface.imageSize);
-            GX2DrawDone();
-            // The matching DCInvalidateRange lives at the top of
-            // ImageEncoder::encodeAndSend - dcbi only affects the core that runs
-            // it, so it has to happen on the consumer, not here.
+
+            if (blocking) {
+                GX2DrawDone();
+                slot->gpuTimestamp = 0;
+            } else {
+                // GX2DrawDone() is precisely GX2Flush() followed by
+                // GX2WaitTimeStamp(GX2GetLastSubmittedTimeStamp()). Only the first
+                // half belongs on the game's render thread: submit the copy and note
+                // the timestamp that retires with it, then leave the waiting to the
+                // encoder. The blocking version stalled the game until the GPU went
+                // idle on every frame we captured, which at 60 captures a second
+                // would be every frame it drew.
+                GX2Flush();
+                slot->gpuTimestamp = GX2GetLastSubmittedTimeStamp();
+            }
+            // The matching DCInvalidateRange happens on the encoder, per band, on the
+            // core that is about to read - dcbi works on the executing core's cache.
         }
     }
 
@@ -304,6 +361,37 @@ CaptureSlot *ScreenCapture::WaitForFrame() {
         return nullptr;
     }
     return (CaptureSlot *) msg.args[0];
+}
+
+bool ScreenCapture::WaitForGpu(const CaptureSlot *slot, uint32_t timeoutMs) {
+    const OSTime ts = slot->gpuTimestamp;
+    if (ts == 0) {
+        return true; // blocking sync already waited on the render thread
+    }
+
+    // Registered exactly like a capture in progress. Teardown clears the gates and
+    // then waits for gCaptureInFlight to drain before the title is allowed to shut
+    // GX2 down, so this can never be left polling a GPU that no longer exists.
+    // The full fence is what stops the gate read below from overtaking this
+    // registration - see captureIfEnabled() in function_patcher.cpp.
+    __atomic_add_fetch(&gCaptureInFlight, 1, __ATOMIC_ACQ_REL);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    bool done            = false;
+    const OSTime deadline = OSGetSystemTime() + OSMillisecondsToTicks(timeoutMs);
+    while (StreamingActive()) {
+        // A plain read of the retired timestamp (TCLReadTimestamp underneath) with
+        // no main-core check - unlike issuing commands, it is safe from any thread.
+        if (GX2GetRetiredTimeStamp() >= ts) {
+            done = true;
+            break;
+        }
+        if (OSGetSystemTime() >= deadline) {
+            break;
+        }
+        OSSleepTicks(OSMicrosecondsToTicks(200));
+    }
+    __atomic_sub_fetch(&gCaptureInFlight, 1, __ATOMIC_ACQ_REL);
+    return done;
 }
 
 void ScreenCapture::ReleaseFrame(CaptureSlot *slot) {

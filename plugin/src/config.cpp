@@ -30,7 +30,11 @@ constexpr const char *KEY_CAPTURE_SIZE = "captureSize";
 constexpr const char *KEY_COLOR_MODE   = "colorMode";
 constexpr const char *KEY_QUALITY      = "quality";
 constexpr const char *KEY_FRAME_SKIP   = "frameSkip";
-constexpr const char *KEY_ENCODER_CORE = "encoderCore";
+// A new key rather than reusing "encoderCore": the old setting stored a core
+// number, and read as a preset index it would mean something different.
+constexpr const char *KEY_ENCODER_CORES = "encoderCores";
+constexpr const char *KEY_ENCODE_PATH   = "encodePath";
+constexpr const char *KEY_GPU_SYNC      = "gpuSync";
 
 ConfigItemMultipleValuesPair sScreenValues[] = {
         {WUPS_STREAMING_SCREEN_TV, "TV"},
@@ -43,6 +47,7 @@ ConfigItemMultipleValuesPair sCaptureSizeValues[] = {
         {WUPS_STREAMING_SIZE_480P, "480p max"},
         {WUPS_STREAMING_SIZE_360P, "360p max"},
         {WUPS_STREAMING_SIZE_240P, "240p max"},
+        {WUPS_STREAMING_SIZE_180P, "180p max"},
 };
 
 ConfigItemMultipleValuesPair sColorValues[] = {
@@ -51,10 +56,24 @@ ConfigItemMultipleValuesPair sColorValues[] = {
 };
 
 ConfigItemMultipleValuesPair sCoreValues[] = {
-        {2, "Core 2"},
-        {0, "Core 0"},
-        {1, "Core 1"},
+        {WUPS_STREAMING_CORES_0_2, "Cores 0 + 2"},
+        {WUPS_STREAMING_CORES_0, "Core 0 only"},
+        {WUPS_STREAMING_CORES_2, "Core 2 only"},
+        {WUPS_STREAMING_CORES_1, "Core 1 only"},
+        {WUPS_STREAMING_CORES_ALL, "All three (0 + 2 + 1)"},
 };
+
+ConfigItemMultipleValuesPair sPathValues[] = {
+        {WUPS_STREAMING_PATH_FAST, "Fast (multi-core)"},
+        {WUPS_STREAMING_PATH_SAFE, "Safe (old single-core)"},
+};
+
+ConfigItemMultipleValuesPair sGpuSyncValues[] = {
+        {WUPS_STREAMING_GPUSYNC_ASYNC, "Async (game never waits)"},
+        {WUPS_STREAMING_GPUSYNC_BLOCKING, "Blocking (old)"},
+};
+
+#define COUNT(arr) ((int) (sizeof(arr) / sizeof((arr)[0])))
 
 /**
  * The API wants the *index* of the current entry, not the value, so a stored
@@ -113,19 +132,34 @@ void frameSkipChanged(ConfigItemIntegerRange *, int32_t newValue) {
     storeU32(KEY_FRAME_SKIP, gFrameSkip);
 }
 
-void encoderCoreChanged(ConfigItemMultipleValues *, uint32_t newValue) {
-    const int32_t core = (int32_t) newValue;
-    if (core == gEncoderCore) {
+void encoderCoresChanged(ConfigItemMultipleValues *, uint32_t newValue) {
+    const int32_t preset = (int32_t) newValue;
+    if (preset == gEncoderCores) {
         return;
     }
-    gEncoderCore = core;
-    storeU32(KEY_ENCODER_CORE, gEncoderCore);
+    gEncoderCores = preset;
+    storeU32(KEY_ENCODER_CORES, gEncoderCores);
 
-    // Affinity is fixed when the thread is created, so this is the one setting
+    // Affinity is fixed when a thread is created, so this is the one setting
     // that needs the encoder rebuilt. Everything else is read per frame.
     if (ImageEncoder::IsRunning()) {
         ImageEncoder::Stop();
         ImageEncoder::Start();
+    }
+}
+
+void encodePathChanged(ConfigItemMultipleValues *, uint32_t newValue) {
+    gEncodePath = (int32_t) newValue;
+    storeU32(KEY_ENCODE_PATH, gEncodePath);
+}
+
+void gpuSyncChanged(ConfigItemMultipleValues *, uint32_t newValue) {
+    gGpuSync = (int32_t) newValue;
+    storeU32(KEY_GPU_SYNC, gGpuSync);
+    if (gGpuSync == WUPS_STREAMING_GPUSYNC_ASYNC) {
+        // Choosing Async explicitly gives it a fresh chance in this title, even if
+        // the encoder had fallen back to blocking.
+        gGpuSyncFallback = false;
     }
 }
 
@@ -140,9 +174,9 @@ WUPSConfigAPICallbackStatus menuOpened(WUPSConfigCategoryHandle rootHandle) {
 
     if (WUPSConfigItemMultipleValues_AddToCategory(
                 rootHandle, KEY_CAPTURE_SIZE, "Resolution",
-                indexOfValue(sCaptureSizeValues, 5, WUPS_STREAMING_SIZE_NATIVE),
-                indexOfValue(sCaptureSizeValues, 5, gCaptureSize),
-                sCaptureSizeValues, 5, &captureSizeChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
+                indexOfValue(sCaptureSizeValues, COUNT(sCaptureSizeValues), WUPS_STREAMING_SIZE_NATIVE),
+                indexOfValue(sCaptureSizeValues, COUNT(sCaptureSizeValues), gCaptureSize),
+                sCaptureSizeValues, COUNT(sCaptureSizeValues), &captureSizeChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
         return WUPSCONFIG_API_CALLBACK_RESULT_ERROR;
     }
 
@@ -155,7 +189,7 @@ WUPSConfigAPICallbackStatus menuOpened(WUPSConfigCategoryHandle rootHandle) {
 
     if (WUPSConfigItemIntegerRange_AddToCategory(
                 rootHandle, KEY_FRAME_SKIP, "Skip N frames between captures",
-                1, gFrameSkip, STREAM_FRAMESKIP_MIN, STREAM_FRAMESKIP_MAX,
+                0, gFrameSkip, STREAM_FRAMESKIP_MIN, STREAM_FRAMESKIP_MAX,
                 &frameSkipChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
         return WUPSCONFIG_API_CALLBACK_RESULT_ERROR;
     }
@@ -169,10 +203,26 @@ WUPSConfigAPICallbackStatus menuOpened(WUPSConfigCategoryHandle rootHandle) {
     }
 
     if (WUPSConfigItemMultipleValues_AddToCategory(
-                rootHandle, KEY_ENCODER_CORE, "Encoder core",
-                indexOfValue(sCoreValues, 3, 2),
-                indexOfValue(sCoreValues, 3, gEncoderCore),
-                sCoreValues, 3, &encoderCoreChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
+                rootHandle, KEY_ENCODER_CORES, "Encoder cores",
+                indexOfValue(sCoreValues, COUNT(sCoreValues), WUPS_STREAMING_CORES_0_2),
+                indexOfValue(sCoreValues, COUNT(sCoreValues), gEncoderCores),
+                sCoreValues, COUNT(sCoreValues), &encoderCoresChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
+        return WUPSCONFIG_API_CALLBACK_RESULT_ERROR;
+    }
+
+    if (WUPSConfigItemMultipleValues_AddToCategory(
+                rootHandle, KEY_ENCODE_PATH, "Encoder",
+                indexOfValue(sPathValues, COUNT(sPathValues), WUPS_STREAMING_PATH_FAST),
+                indexOfValue(sPathValues, COUNT(sPathValues), gEncodePath),
+                sPathValues, COUNT(sPathValues), &encodePathChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
+        return WUPSCONFIG_API_CALLBACK_RESULT_ERROR;
+    }
+
+    if (WUPSConfigItemMultipleValues_AddToCategory(
+                rootHandle, KEY_GPU_SYNC, "GPU sync",
+                indexOfValue(sGpuSyncValues, COUNT(sGpuSyncValues), WUPS_STREAMING_GPUSYNC_ASYNC),
+                indexOfValue(sGpuSyncValues, COUNT(sGpuSyncValues), gGpuSync),
+                sGpuSyncValues, COUNT(sGpuSyncValues), &gpuSyncChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
         return WUPSCONFIG_API_CALLBACK_RESULT_ERROR;
     }
 
@@ -190,11 +240,16 @@ void menuClosed() {
 
 void Init() {
     gScreen      = loadU32(KEY_SCREEN, WUPS_STREAMING_SCREEN_TV, 0, 1);
-    gCaptureSize = loadU32(KEY_CAPTURE_SIZE, WUPS_STREAMING_SIZE_NATIVE, 0, WUPS_STREAMING_SIZE_240P);
+    gCaptureSize = loadU32(KEY_CAPTURE_SIZE, WUPS_STREAMING_SIZE_NATIVE, 0, WUPS_STREAMING_SIZE_LAST);
     gColorMode   = loadU32(KEY_COLOR_MODE, WUPS_STREAMING_COLOR_AUTO, 0, 1);
     gQuality     = loadU32(KEY_QUALITY, 55, STREAM_QUALITY_MIN, STREAM_QUALITY_MAX);
-    gFrameSkip   = loadU32(KEY_FRAME_SKIP, 1, STREAM_FRAMESKIP_MIN, STREAM_FRAMESKIP_MAX);
-    gEncoderCore = loadU32(KEY_ENCODER_CORE, 2, 0, 2);
+    // Default 0: capturing is cheap for the game now (no GPU stall, no per-frame
+    // cache flush) and only happens when the encoder has a slot free, so skipping
+    // frames on purpose just caps a 60 fps game at 30.
+    gFrameSkip    = loadU32(KEY_FRAME_SKIP, 0, STREAM_FRAMESKIP_MIN, STREAM_FRAMESKIP_MAX);
+    gEncoderCores = loadU32(KEY_ENCODER_CORES, WUPS_STREAMING_CORES_0_2, 0, WUPS_STREAMING_CORES_LAST);
+    gEncodePath   = loadU32(KEY_ENCODE_PATH, WUPS_STREAMING_PATH_FAST, WUPS_STREAMING_PATH_FAST, WUPS_STREAMING_PATH_SAFE);
+    gGpuSync      = loadU32(KEY_GPU_SYNC, WUPS_STREAMING_GPUSYNC_ASYNC, WUPS_STREAMING_GPUSYNC_ASYNC, WUPS_STREAMING_GPUSYNC_BLOCKING);
 
     WUPSConfigAPIOptionsV1 options = {.name = "Screen Streaming"};
     const WUPSConfigAPIStatus status = WUPSConfigAPI_Init(options, menuOpened, menuClosed);
