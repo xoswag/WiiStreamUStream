@@ -2,7 +2,9 @@ name: plugin
 
 on:
   push:
-    branches: ["**"]
+    # ci-log/* branches are written by this workflow itself (see below), so they
+    # must never trigger it.
+    branches: ["**", "!ci-log/**"]
     paths:
       - "plugin/**"
       - ".github/workflows/plugin.yml"
@@ -11,6 +13,10 @@ on:
       - "plugin/**"
       - ".github/workflows/plugin.yml"
   workflow_dispatch:
+
+# contents: write only so each job can publish its build log to a ci-log/* branch.
+permissions:
+  contents: write
 
 defaults:
   run:
@@ -26,7 +32,8 @@ jobs:
         run: docker build . -t wiistreamustream-builder
 
       - name: make
-        run: docker run --rm -v ${PWD}:/project wiistreamustream-builder make
+        shell: bash # pipefail, so a failing make still fails the step through tee
+        run: docker run --rm -v ${PWD}:/project wiistreamustream-builder make 2>&1 | tee build.log
 
       - name: Check the plugin was produced
         run: test -f wiistreamustream.wps
@@ -42,6 +49,17 @@ jobs:
           path: plugin/wiiu
           if-no-files-found: error
 
+      # The repository is private, so the job log is not readable without a
+      # token. Publishing it to a throwaway branch makes compiler output
+      # available to anyone who can already `git fetch` the repo.
+      - name: Publish the build log
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOG_BRANCH: ci-log/plugin-release
+          JOB_STATUS: ${{ job.status }}
+        run: bash ../.github/publish-log.sh build.log
+
   build-debug:
     runs-on: ubuntu-latest
     steps:
@@ -51,12 +69,23 @@ jobs:
         run: docker build . -t wiistreamustream-builder
 
       # DEBUG=1 turns on the WHBLog output, which is how you see the per-second
-      # capture/encode/drop counters over UDP while the stream is running.
+      # capture/encode/drop counters over UDP while the stream is running. It is
+      # also the only build that compiles the log format strings, so its compile
+      # errors are worth seeing separately.
       - name: make DEBUG=1
-        run: docker run --rm -v ${PWD}:/project wiistreamustream-builder make DEBUG=1
+        shell: bash
+        run: docker run --rm -v ${PWD}:/project wiistreamustream-builder make DEBUG=1 2>&1 | tee build.log
 
       - uses: actions/upload-artifact@v4
         with:
           name: wiistreamustream-debug
           path: plugin/wiistreamustream.wps
           if-no-files-found: error
+
+      - name: Publish the build log
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOG_BRANCH: ci-log/plugin-debug
+          JOB_STATUS: ${{ job.status }}
+        run: bash ../.github/publish-log.sh build.log
