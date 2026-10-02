@@ -17,6 +17,7 @@ int32_t gFrameSkip    = 0;
 int32_t gEncoderCores = WUPS_STREAMING_CORES_0_2;
 int32_t gEncodePath   = WUPS_STREAMING_PATH_FAST;
 int32_t gGpuSync      = WUPS_STREAMING_GPUSYNC_ASYNC;
+int32_t gAudioEnabled = 1;
 
 volatile bool gGpuSyncFallback = false;
 

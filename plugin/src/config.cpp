@@ -35,6 +35,7 @@ constexpr const char *KEY_FRAME_SKIP   = "frameSkip";
 constexpr const char *KEY_ENCODER_CORES = "encoderCores";
 constexpr const char *KEY_ENCODE_PATH   = "encodePath";
 constexpr const char *KEY_GPU_SYNC      = "gpuSync";
+constexpr const char *KEY_AUDIO         = "audio";
 
 ConfigItemMultipleValuesPair sScreenValues[] = {
         {WUPS_STREAMING_SCREEN_TV, "TV"},
@@ -71,6 +72,11 @@ ConfigItemMultipleValuesPair sPathValues[] = {
 ConfigItemMultipleValuesPair sGpuSyncValues[] = {
         {WUPS_STREAMING_GPUSYNC_ASYNC, "Async (game never waits)"},
         {WUPS_STREAMING_GPUSYNC_BLOCKING, "Blocking (old)"},
+};
+
+ConfigItemMultipleValuesPair sAudioValues[] = {
+        {1, "On"},
+        {0, "Off (from the next game start)"},
 };
 
 #define COUNT(arr) ((int) (sizeof(arr) / sizeof((arr)[0])))
@@ -163,6 +169,15 @@ void gpuSyncChanged(ConfigItemMultipleValues *, uint32_t newValue) {
     }
 }
 
+void audioChanged(ConfigItemMultipleValues *, uint32_t newValue) {
+    // Takes effect at once for a title whose mixer is already hooked (capture just
+    // stops or resumes). Hooking itself happens when a title starts its audio, so
+    // switching Off -> On mid-title applies from the next title, and Off at title
+    // start means nothing of ours is put into the mixer at all.
+    gAudioEnabled = (int32_t) newValue;
+    storeU32(KEY_AUDIO, gAudioEnabled);
+}
+
 WUPSConfigAPICallbackStatus menuOpened(WUPSConfigCategoryHandle rootHandle) {
     if (WUPSConfigItemMultipleValues_AddToCategory(
                 rootHandle, KEY_SCREEN, "Screen to stream",
@@ -226,6 +241,14 @@ WUPSConfigAPICallbackStatus menuOpened(WUPSConfigCategoryHandle rootHandle) {
         return WUPSCONFIG_API_CALLBACK_RESULT_ERROR;
     }
 
+    if (WUPSConfigItemMultipleValues_AddToCategory(
+                rootHandle, KEY_AUDIO, "Audio",
+                indexOfValue(sAudioValues, COUNT(sAudioValues), 1),
+                indexOfValue(sAudioValues, COUNT(sAudioValues), gAudioEnabled),
+                sAudioValues, COUNT(sAudioValues), &audioChanged) != WUPSCONFIG_API_RESULT_SUCCESS) {
+        return WUPSCONFIG_API_CALLBACK_RESULT_ERROR;
+    }
+
     return WUPSCONFIG_API_CALLBACK_RESULT_SUCCESS;
 }
 
@@ -250,6 +273,7 @@ void Init() {
     gEncoderCores = loadU32(KEY_ENCODER_CORES, WUPS_STREAMING_CORES_0_2, 0, WUPS_STREAMING_CORES_LAST);
     gEncodePath   = loadU32(KEY_ENCODE_PATH, WUPS_STREAMING_PATH_FAST, WUPS_STREAMING_PATH_FAST, WUPS_STREAMING_PATH_SAFE);
     gGpuSync      = loadU32(KEY_GPU_SYNC, WUPS_STREAMING_GPUSYNC_ASYNC, WUPS_STREAMING_GPUSYNC_ASYNC, WUPS_STREAMING_GPUSYNC_BLOCKING);
+    gAudioEnabled = loadU32(KEY_AUDIO, 1, 0, 1);
 
     WUPSConfigAPIOptionsV1 options = {.name = "Screen Streaming"};
     const WUPSConfigAPIStatus status = WUPSConfigAPI_Init(options, menuOpened, menuClosed);

@@ -91,6 +91,35 @@ public final class StreamProtocol {
     public static final byte PING = 0x15;
     public static final byte PONG = 0x16;
 
+    // --- Side channel: audio and status datagrams --------------------------------
+    // They arrive on the same UDP port as video and are told apart by their magic.
+
+    /** 'W' 'U' 'S' 'A' - one block of compressed game audio. */
+    public static final int AUDIO_MAGIC = 0x57555341;
+    public static final int AUDIO_VERSION = 1;
+    public static final int AUDIO_HEADER_SIZE = 32;
+    /** IMA ADPCM, 4 bits per sample; a stereo frame is one byte, left in the low nibble. */
+    public static final int AUDIO_CODEC_IMA_ADPCM = 1;
+
+    public static final int AUDIO_OFF_VERSION = 4;
+    public static final int AUDIO_OFF_CODEC = 5;
+    public static final int AUDIO_OFF_CHANNELS = 6;
+    public static final int AUDIO_OFF_SAMPLE_RATE = 8;
+    public static final int AUDIO_OFF_SEQUENCE = 12;
+    public static final int AUDIO_OFF_FIRST_FRAME = 16;
+    public static final int AUDIO_OFF_FRAMES = 20;
+    public static final int AUDIO_OFF_PREDICTOR_L = 24;
+    public static final int AUDIO_OFF_PREDICTOR_R = 26;
+    public static final int AUDIO_OFF_INDEX_L = 28;
+    public static final int AUDIO_OFF_INDEX_R = 29;
+
+    /** 'W' 'U' 'S' 'S' - a plain-text status report from the console, about once a second. */
+    public static final int STATUS_MAGIC = 0x57555353;
+    public static final int STATUS_VERSION = 1;
+    public static final int STATUS_HEADER_SIZE = 8;
+    public static final int STATUS_OFF_VERSION = 4;
+    public static final int STATUS_OFF_LENGTH = 6;
+
     /** Bytes per pixel for a raw pixel format, or 0 if it is not a raw layout. */
     public static int bytesPerPixel(int pixelFormat) {
         switch (pixelFormat) {

@@ -27,6 +27,9 @@ import java.awt.Dimension;
 import java.awt.GraphicsEnvironment;
 import java.awt.Rectangle;
 
+import java.util.function.Consumer;
+
+import javax.swing.JCheckBoxMenuItem;
 import javax.swing.JFrame;
 import javax.swing.JMenu;
 import javax.swing.JMenuBar;
@@ -40,7 +43,7 @@ public class StreamWindow {
 
     private final ImagePanel image;
 
-    public StreamWindow(IImageProvider imageProvider) {
+    public StreamWindow(IImageProvider imageProvider, Consumer<Boolean> onMuteChanged) {
         final Dimension size = defaultSize();
         image = new ImagePanel(size.width, size.height);
 
@@ -49,7 +52,7 @@ public class StreamWindow {
 
         imageProvider.setOnImageChange(image::setImage);
 
-        frame.setJMenuBar(buildMenuBar());
+        frame.setJMenuBar(buildMenuBar(onMuteChanged));
         frame.getContentPane().setLayout(new BorderLayout());
         frame.getContentPane().add(image, BorderLayout.CENTER);
 
@@ -73,7 +76,7 @@ public class StreamWindow {
         return new Dimension((int) Math.round(NATIVE_WIDTH * scale), (int) Math.round(NATIVE_HEIGHT * scale));
     }
 
-    private static JMenuBar buildMenuBar() {
+    private static JMenuBar buildMenuBar(Consumer<Boolean> onMuteChanged) {
         final JMenuBar menuBar = new JMenuBar();
         final JMenu mnSettings = new JMenu("Settings");
         menuBar.add(mnSettings);
@@ -81,6 +84,10 @@ public class StreamWindow {
         final JMenuItem mntmConfig = new JMenuItem("Config (configure on the console)");
         mntmConfig.setEnabled(false);
         mnSettings.add(mntmConfig);
+
+        final JCheckBoxMenuItem mntmMute = new JCheckBoxMenuItem("Mute audio");
+        mntmMute.addActionListener(e -> onMuteChanged.accept(mntmMute.isSelected()));
+        mnSettings.add(mntmMute);
 
         final JMenuItem mntmExit = new JMenuItem("Exit");
         mntmExit.addActionListener(e -> System.exit(0));

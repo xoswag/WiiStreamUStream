@@ -92,8 +92,12 @@ latency measurement.
   `height * stride == frameSize` before trusting the geometry — otherwise a spoofed
   width/height is an out-of-bounds read waiting to happen. JPEG carries its own dimensions,
   so its header `width`/`height`/`stride` are advisory.
-* Assemble into a buffer keyed by `frameId`. A datagram for a newer `frameId` retires the
-  frame in progress — incomplete frames are discarded, never rendered.
+* Assemble into a buffer keyed by `frameId`, and **keep the previous frame open while the next
+  one starts**: the network can deliver the last chunk of frame N just after the first chunk of
+  frame N+1 (measured on hardware: about three of every four "incomplete" frames were this).
+  Frame N may still be shown if it completes before N+1 does; once N+1 is shown, or N+2
+  starts, N is discarded. Frames are never rendered out of order, and incomplete frames are
+  never rendered.
 * **Clear the staleness filter on every (re)connect.** `frameId` is monotonic only within one
   run of the plugin: the console keeps counting across a client reconnect, but a title change
   reloads the plugin and restarts it at 0. A receiver that rejects "not newer than the last
@@ -103,6 +107,50 @@ latency measurement.
   incomplete frame look finished.
 * When the received byte count reaches `frameSize`, verify CRC-32 and decode. On mismatch,
   drop the frame and carry on — the next frame is unaffected.
+
+## Side channel: audio and status
+
+Two more datagram types share the video's UDP port. They are told apart by their first four
+bytes; a receiver that does not know a magic ignores the datagram. The console sends them
+from a second socket, so they never wait behind a video frame.
+
+### Audio — `WUSA`, version 1
+
+| Offset | Size | Field        | Meaning                                                        |
+|-------:|-----:|--------------|----------------------------------------------------------------|
+| 0      | 4    | `magic`      | `0x57555341` ("WUSA")                                          |
+| 4      | 1    | `version`    | 1                                                              |
+| 5      | 1    | `codec`      | 1 = IMA ADPCM, 4 bits per sample                               |
+| 6      | 1    | `channels`   | 2                                                              |
+| 7      | 1    | reserved     | 0                                                              |
+| 8      | 4    | `sampleRate` | Hz (48000, or 32000 for titles using the 32 kHz renderer)      |
+| 12     | 4    | `sequence`   | +1 per block, wraps                                            |
+| 16     | 4    | `firstFrame` | sample-frame index of the block's first frame, wraps           |
+| 20     | 2    | `frames`     | sample frames in the block (960 = 20 ms at 48 kHz)             |
+| 22     | 2    | reserved     | 0                                                              |
+| 24     | 4    | `predictor`  | int16 left, int16 right: ADPCM state at the first frame        |
+| 28     | 2    | `stepIndex`  | uint8 left, uint8 right                                        |
+| 30     | 2    | reserved     | 0                                                              |
+| 32     | n    | data         | one byte per stereo frame: left code in the low nibble         |
+
+Each block carries the decoder state it starts from, so it decodes on its own — a lost block
+costs its own 20 ms and nothing after it. `firstFrame` lets a receiver fill a gap with exactly
+the silence it stands for, keeping sound and picture in step. The codec is standard IMA/DVI
+ADPCM (89-entry step table, index table `-1 -1 -1 -1 2 4 6 8`).
+
+### Status — `WUSS`, version 1
+
+| Offset | Size | Field     | Meaning                  |
+|-------:|-----:|-----------|--------------------------|
+| 0      | 4    | `magic`   | `0x57555353` ("WUSS")    |
+| 4      | 1    | `version` | 1                        |
+| 5      | 1    | `kind`    | 0 = text                 |
+| 6      | 2    | `length`  | bytes of text that follow (at most 1200) |
+
+Plain ASCII, about once a second, one item per line: `settings ...` (the plugin menu),
+`state ...` (what is running — game, Wii U Menu — and what is being streamed) and `perf ...`
+(the console's own frame rates and bottleneck counters). The format of each line is for
+people, not parsers; the client logs them.
 
 ## CRC-32
 

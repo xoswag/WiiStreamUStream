@@ -37,10 +37,12 @@ import java.util.logging.Logger;
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
 
+import de.mas.wiiu.streaming.audio.AudioPlayer;
 import de.mas.wiiu.streaming.gui.IImageProvider;
 import de.mas.wiiu.streaming.gui.ImageProvider;
 import de.mas.wiiu.streaming.network.Frame;
 import de.mas.wiiu.streaming.network.FrameAssembler;
+import de.mas.wiiu.streaming.network.StatusReporter;
 import de.mas.wiiu.streaming.network.StreamProtocol;
 import de.mas.wiiu.streaming.network.TCPClient;
 import de.mas.wiiu.streaming.network.UDPClient;
@@ -53,6 +55,10 @@ public class ImageStreamer {
     private final TCPClient tcpClient;
     private final UDPClient udpClient;
     private final FrameAssembler assembler;
+    private final AudioPlayer audioPlayer = new AudioPlayer();
+    private final StatusReporter statusReporter = new StatusReporter();
+    private long lastAudioPackets = 0;
+    private long lastAudioFilled = 0;
 
     /**
      * Decoding runs off the receive thread. A 720p JPEG takes long enough to decode that
@@ -96,7 +102,7 @@ public class ImageStreamer {
         udpClient = new UDPClient(StreamProtocol.UDP_PORT);
         assembler = new FrameAssembler(this::onFrameAssembled);
 
-        udpClient.setOnDataCallback(assembler::accept);
+        udpClient.setOnDataCallback(this::onDatagram);
         startDaemon("UDPClient", udpClient);
         startDaemon("Decoder", this::decodeLoop);
         startDaemon("Heartbeat", this::heartbeatLoop);
@@ -108,6 +114,32 @@ public class ImageStreamer {
         // Daemon threads so closing the window actually exits the process.
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * Video, audio and status all arrive on the one UDP port and are told apart by
+     * their magic. Anything unrecognised goes to the frame assembler, which counts
+     * it as ignored - the same as before audio existed.
+     */
+    private void onDatagram(byte[] data, int length) {
+        if (length >= 4) {
+            final int magic = ((data[0] & 0xFF) << 24) | ((data[1] & 0xFF) << 16) | ((data[2] & 0xFF) << 8)
+                    | (data[3] & 0xFF);
+            if (magic == StreamProtocol.AUDIO_MAGIC) {
+                audioPlayer.accept(data, length);
+                return;
+            }
+            if (magic == StreamProtocol.STATUS_MAGIC) {
+                statusReporter.accept(data, length);
+                return;
+            }
+        }
+        assembler.accept(data, length);
+    }
+
+    public void setAudioMuted(boolean muted) {
+        audioPlayer.setMuted(muted);
+        log.info(muted ? "Audio muted." : "Audio unmuted.");
     }
 
     private void onFrameAssembled(Frame frame) {
@@ -214,6 +246,8 @@ public class ImageStreamer {
                     // The console's frame counter restarts whenever the plugin is
                     // reloaded, so a reconnect needs a fresh view of frame ids.
                     assembler.requestReset();
+                    audioPlayer.reset();
+                    statusReporter.reset();
                     missedPings = 0;
                     log.info("Connected.");
                 } catch (IllegalArgumentException | UnknownHostException e1) {
@@ -254,12 +288,24 @@ public class ImageStreamer {
             final long decodeNanos = decodeNanosThisSecond.getAndSet(0);
             final double avgDecodeMs = decoded > 0 ? (decodeNanos / (double) decoded) / 1_000_000.0 : 0.0;
 
+            final long audioPackets = audioPlayer.getPacketsReceived();
+            final long audioFilled = audioPlayer.getFramesFilled();
+            final long audioPacketsThisSecond = audioPackets - lastAudioPackets;
+            final long audioFilledThisSecond = audioFilled - lastAudioFilled;
+            lastAudioPackets = audioPackets;
+            lastAudioFilled = audioFilled;
+            final String audio = audioPacketsThisSecond > 0
+                    ? String.format(" | audio %d pkt/s (lost %d ms)", audioPacketsThisSecond,
+                            audioPlayer.getSampleRate() > 0 ? audioFilledThisSecond * 1000 / audioPlayer.getSampleRate()
+                                    : 0)
+                    : "";
+
             log.info(String.format(
-                    "recv %d fps | disp %d fps (decode %.1f ms) | %.2f Mbit/s | incomplete=%d crcfail=%d "
-                            + "ignored=%d backlogdrop=%d wrongsrc=%d",
+                    "recv %d fps | disp %d fps (decode %.1f ms) | %.2f Mbit/s | incomplete=%d late-ok=%d crcfail=%d "
+                            + "ignored=%d backlogdrop=%d wrongsrc=%d%s",
                     framesThisSecond, decoded, avgDecodeMs, (bytesThisSecond * 8.0) / 1_000_000.0,
-                    assembler.getFramesIncomplete(), assembler.getFramesCrcFailed(), assembler.getDatagramsIgnored(),
-                    backlogDrops.get(), udpClient.getWrongSourceDiscards()));
+                    assembler.getFramesIncomplete(), assembler.getFramesCompletedLate(), assembler.getFramesCrcFailed(),
+                    assembler.getDatagramsIgnored(), backlogDrops.get(), udpClient.getWrongSourceDiscards(), audio));
 
             if (framesThisSecond == 0 && assembler.getDatagramsIgnored() > 0 && completed == 0) {
                 log.warning("Connected but no valid frames yet. If the Wii U is running the original "

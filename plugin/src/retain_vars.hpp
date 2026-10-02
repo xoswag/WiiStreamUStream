@@ -88,6 +88,8 @@ extern int32_t gFrameSkip;
 extern int32_t gEncoderCores;
 extern int32_t gEncodePath;
 extern int32_t gGpuSync;
+/** 1 = stream game audio. Hooking the mixer happens at title start, so turning it on mid-title applies from the next. */
+extern int32_t gAudioEnabled;
 
 /**
  * Set by the encoder when asynchronous GPU sync keeps timing out, so the capture

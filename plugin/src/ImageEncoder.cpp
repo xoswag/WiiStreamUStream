@@ -582,6 +582,21 @@ struct Worker {
 Worker sWorkers[MAX_WORKERS];
 int sWorkerCount = 0;
 
+static_assert(MAX_WORKERS == MAX_ENCODER_CORES, "Stats sizes its per-core arrays by MAX_ENCODER_CORES");
+
+// Always-on counters for the status report. Written by the leader (and by Start),
+// read from any thread with atomic loads - so unlike the DEBUG report they exist
+// in release builds too, which is what the client log shows.
+Stats sPub = {};
+
+inline void pubAdd(uint32_t &field, uint32_t v) {
+    __atomic_add_fetch(&field, v, __ATOMIC_RELAXED);
+}
+
+inline void pubSet(uint32_t &field, uint32_t v) {
+    __atomic_store_n(&field, v, __ATOMIC_RELAXED);
+}
+
 OSMessageQueue sDoneQueue;
 OSMessage sDoneMessages[DONE_QUEUE_SIZE];
 
@@ -774,6 +789,7 @@ void bench(Worker &w, const char *why, OSTime now) {
     w.benched     = true;
     w.slowStreak  = 0;
     w.lastProbeAt = now;
+    pubSet(sPub.benched[w.index], 1);
 }
 
 /** Applies one completion message to the bookkeeping of the worker it came from. */
@@ -790,6 +806,9 @@ void onDone(const OSMessage &msg) {
     w.busy          = false;
     w.completedTag  = tag;
     w.lastLatencyUs = ticksToUs(w.lastDoneAt - w.dispatchedAt);
+    if (!w.probing) {
+        pubSet(sPub.bandLatencyUs[idx], w.lastLatencyUs);
+    }
 
     if (w.probing) {
         w.probing         = false;
@@ -800,6 +819,7 @@ void onDone(const OSMessage &msg) {
             w.benched     = false;
             w.slowStreak  = 0;
             w.unbenchedAt = OSGetSystemTime();
+            pubSet(sPub.benched[idx], 0);
             DEBUG_FUNCTION_LINE("Core %d rejoins: trial band at %u ns/row vs leader %u ns/row",
                                 w.core, ns, sLeaderNsPerRow);
         }
@@ -1038,6 +1058,10 @@ struct ReportWindow {
     uint32_t submitDrops;
     uint32_t sendUs;
     uint32_t sendCount;
+    // Baselines rather than resets: the status report reads the same counters.
+    uint32_t presented;
+    uint32_t captured;
+    uint32_t encBusy;
 };
 
 void resetWindow(ReportWindow &r) {
@@ -1049,7 +1073,9 @@ void resetWindow(ReportWindow &r) {
     r.submitDrops = StreamSender::GetSubmitDrops();
     r.sendUs      = StreamSender::GetSendUsTotal();
     r.sendCount   = StreamSender::GetSendCount();
-    ScreenCapture::ResetCounters();
+    r.presented   = ScreenCapture::GetPresentedCount();
+    r.captured    = ScreenCapture::GetCapturedCount();
+    r.encBusy     = ScreenCapture::GetSkippedCount();
 }
 
 #define MS2(us) (uint32_t) ((us) / 1000), (uint32_t) (((us) % 1000) / 10)
@@ -1063,9 +1089,9 @@ void report(ReportWindow &r) {
     }
 
     // Snapshot every counter once so the lines below agree with each other.
-    const uint32_t presented  = ScreenCapture::GetPresentedCount();
-    const uint32_t captured   = ScreenCapture::GetCapturedCount();
-    const uint32_t encBusy    = ScreenCapture::GetSkippedCount();
+    const uint32_t presented  = ScreenCapture::GetPresentedCount() - r.presented;
+    const uint32_t captured   = ScreenCapture::GetCapturedCount() - r.captured;
+    const uint32_t encBusy    = ScreenCapture::GetSkippedCount() - r.encBusy;
     const uint32_t framesSent = StreamSender::GetFramesSent() - r.framesSent;
     const uint64_t bytesSent  = StreamSender::GetBytesSent() - r.bytesSent;
     const uint64_t wireSent   = StreamSender::GetWireBytesSent() - r.wireSent;
@@ -1165,6 +1191,7 @@ int leaderEntry(int /*argc*/, const char ** /*argv*/) {
         if (!ScreenCapture::WaitForGpu(slot, GPU_WAIT_TIMEOUT_MS)) {
             ScreenCapture::ReleaseFrame(slot);
             if (StreamingActive()) {
+                pubAdd(sPub.gpuTimeouts, 1);
 #ifdef DEBUG
                 window.gpuTimeouts++;
 #endif
@@ -1217,6 +1244,16 @@ int leaderEntry(int /*argc*/, const char ** /*argv*/) {
                     .pixelFormat     = STREAM_PIXFMT_JPEG,
             };
             ok = StreamSender::Submit(payload, payloadSize, meta);
+        }
+
+        if (ok) {
+            pubAdd(sPub.framesEncoded, 1);
+            pubAdd(sPub.frameUsTotal, ticksToUs(OSGetSystemTime() - frameStart));
+            pubAdd(sPub.bandsTotal, timing.bands);
+            pubSet(sPub.width, dstW);
+            pubSet(sPub.height, dstH);
+        } else {
+            pubAdd(sPub.framesDropped, 1);
         }
 
 #ifdef DEBUG
@@ -1378,7 +1415,11 @@ bool Start() {
         if (i > 0) {
             OSInitMessageQueue(&w.jobQueue, w.jobMessages, JOB_QUEUE_SIZE);
         }
+        __atomic_store_n(&sPub.core[i], (int32_t) w.core, __ATOMIC_RELAXED);
+        pubSet(sPub.benched[i], w.benched ? 1 : 0);
+        pubSet(sPub.bandLatencyUs[i], 0);
     }
+    __atomic_store_n(&sPub.coreCount, (int32_t) count, __ATOMIC_RELAXED);
     sWorkerCount = count;
 
     // Followers first, so they are waiting by the time the leader hands out work.
@@ -1461,6 +1502,22 @@ bool IsRunning() {
     // Whether threads are *owned*, which is what Start() tests too, so the two
     // agree even while a thread is starting up or winding down.
     return sWorkerCount > 0;
+}
+
+void GetStats(Stats &out) {
+    out.framesEncoded = __atomic_load_n(&sPub.framesEncoded, __ATOMIC_RELAXED);
+    out.framesDropped = __atomic_load_n(&sPub.framesDropped, __ATOMIC_RELAXED);
+    out.gpuTimeouts   = __atomic_load_n(&sPub.gpuTimeouts, __ATOMIC_RELAXED);
+    out.frameUsTotal  = __atomic_load_n(&sPub.frameUsTotal, __ATOMIC_RELAXED);
+    out.bandsTotal    = __atomic_load_n(&sPub.bandsTotal, __ATOMIC_RELAXED);
+    out.width         = __atomic_load_n(&sPub.width, __ATOMIC_RELAXED);
+    out.height        = __atomic_load_n(&sPub.height, __ATOMIC_RELAXED);
+    out.coreCount     = __atomic_load_n(&sPub.coreCount, __ATOMIC_RELAXED);
+    for (int i = 0; i < MAX_ENCODER_CORES; i++) {
+        out.core[i]          = __atomic_load_n(&sPub.core[i], __ATOMIC_RELAXED);
+        out.benched[i]       = __atomic_load_n(&sPub.benched[i], __ATOMIC_RELAXED);
+        out.bandLatencyUs[i] = __atomic_load_n(&sPub.bandLatencyUs[i], __ATOMIC_RELAXED);
+    }
 }
 
 } // namespace ImageEncoder

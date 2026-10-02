@@ -30,10 +30,17 @@ import java.util.zip.CRC32;
 /**
  * Reassembles v3 datagrams into whole frames.
  *
- * Only ever one frame is in flight: the Wii U sends a frame's chunks back to back and
- * never interleaves two frames, so a datagram belonging to a newer frame is proof that
- * the frame in progress will never complete. Holding a single frame keeps this allocation
- * free in the steady state and bounds memory no matter what arrives on the wire.
+ * The Wii U sends a frame's chunks back to back and never interleaves two frames,
+ * but the network does not promise to deliver them in that order: on real
+ * hardware the last chunk of a frame regularly arrived just after the first chunk
+ * of the next one. Treating the first chunk of a newer frame as proof that the
+ * current one was lost threw away about three of every four "incomplete" frames
+ * in a measured session - their missing piece was already on its way.
+ *
+ * So two frames are kept open: the newest, and the one before it. A straggler
+ * for the older one can still complete it, and it is shown as long as the newer
+ * frame has not been shown yet - frames are never displayed out of order. The
+ * older frame is given up when a third frame starts or the newer one completes.
  *
  * Not thread safe - drive it from the single UDP receive thread.
  */
@@ -41,26 +48,56 @@ public final class FrameAssembler {
     private final Consumer<Frame> onFrame;
     private final CRC32 crc = new CRC32();
 
-    private boolean haveFrame = false;
+    /** One frame being assembled. Two of these are reused forever, so steady state allocates nothing. */
+    private static final class Slot {
+        boolean active;
+        int id;
+        int size;
+        int crc;
+        long timestampUs;
+        int width;
+        int height;
+        int stride;
+        int comp;
+        int pixfmt;
+        byte[] buffer = new byte[0];
+        int received;
+        /** One bit per chunk slot, so a duplicated datagram cannot be counted twice. */
+        final BitSet seen = new BitSet();
+
+        void start(int id, int size, int crc, long timestampUs, int width, int height, int stride, int comp,
+                int pixfmt) {
+            this.id = id;
+            this.size = size;
+            this.crc = crc;
+            this.timestampUs = timestampUs;
+            this.width = width;
+            this.height = height;
+            this.stride = stride;
+            this.comp = comp;
+            this.pixfmt = pixfmt;
+            received = 0;
+            seen.clear();
+            if (buffer.length < size) {
+                buffer = new byte[size];
+            }
+            active = true;
+        }
+
+        boolean matches(int size, int crc, int comp, int pixfmt, int width, int height, int stride) {
+            return this.size == size && this.crc == crc && this.comp == comp && this.pixfmt == pixfmt
+                    && this.width == width && this.height == height && this.stride == stride;
+        }
+    }
+
+    /** The newest frame being assembled. */
+    private Slot current = new Slot();
+    /** The frame before it, kept open briefly for late chunks. Only ever active while current is. */
+    private Slot previous = new Slot();
+
     private boolean haveCompleted = false;
     private int lastCompletedFrameId;
     private volatile boolean sessionReset = false;
-
-    // Metadata of the frame currently being assembled.
-    private int frameId;
-    private int frameSize;
-    private int frameCrc;
-    private long frameTimestampUs;
-    private int frameWidth;
-    private int frameHeight;
-    private int frameStride;
-    private int frameComp;
-    private int framePixfmt;
-
-    private byte[] buffer = new byte[0];
-    private int receivedBytes;
-    /** One bit per chunk slot, so a duplicated datagram cannot be counted twice. */
-    private final BitSet seenChunks = new BitSet();
 
     // Statistics, read by the UI/logging thread.
     private volatile long framesCompleted = 0;
@@ -68,6 +105,7 @@ public final class FrameAssembler {
     private volatile long framesCrcFailed = 0;
     private volatile long datagramsIgnored = 0;
     private volatile long bytesReceived = 0;
+    private volatile long framesCompletedLate = 0;
 
     public FrameAssembler(Consumer<Frame> onFrame) {
         this.onFrame = onFrame;
@@ -90,7 +128,8 @@ public final class FrameAssembler {
     public void accept(byte[] data, int length) {
         if (sessionReset) {
             sessionReset = false;
-            haveFrame = false;
+            current.active = false;
+            previous.active = false;
             haveCompleted = false;
         }
 
@@ -152,23 +191,37 @@ public final class FrameAssembler {
             return;
         }
 
-        if (!haveFrame || pktFrameId != frameId) {
-            // A duplicate of a frame we already finished must not restart it, and
-            // neither must a chunk of an older frame. Frame ids only move forward,
-            // so anything not newer than what we last saw is stale.
-            final int newestSeen = haveFrame ? frameId : lastCompletedFrameId;
-            if ((haveFrame || haveCompleted) && !isNewer(pktFrameId, newestSeen)) {
+        final Slot slot;
+        if (current.active && pktFrameId == current.id) {
+            slot = current;
+        } else if (previous.active && pktFrameId == previous.id) {
+            slot = previous;
+        } else {
+            // Not a frame in progress. A duplicate of a finished frame must not
+            // restart it, and neither must a chunk of an older one: frame ids only
+            // move forward, so anything not newer than the newest seen is stale.
+            final int newestSeen = current.active ? current.id : lastCompletedFrameId;
+            if ((current.active || haveCompleted) && !isNewer(pktFrameId, newestSeen)) {
                 datagramsIgnored++;
                 return;
             }
-            if (haveFrame) {
+            // A newer frame starts. The frame before the current one has had its
+            // chance; the current one stays open, as the previous, for stragglers.
+            if (previous.active) {
+                previous.active = false;
                 framesIncomplete++;
             }
-            startFrame(pktFrameId, pktFrameSize, pktFrameCrc, pktTimestampUs, pktWidth, pktHeight, pktStride, pktComp,
-                    pktPixfmt);
-        } else if (pktFrameSize != frameSize || pktFrameCrc != frameCrc || pktComp != frameComp
-                || pktPixfmt != framePixfmt || pktWidth != frameWidth || pktHeight != frameHeight
-                || pktStride != frameStride) {
+            if (current.active) {
+                final Slot t = previous;
+                previous = current;
+                current = t;
+            }
+            current.start(pktFrameId, pktFrameSize, pktFrameCrc, pktTimestampUs, pktWidth, pktHeight, pktStride,
+                    pktComp, pktPixfmt);
+            slot = current;
+        }
+
+        if (!slot.matches(pktFrameSize, pktFrameCrc, pktComp, pktPixfmt, pktWidth, pktHeight, pktStride)) {
             // Same id but disagreeing metadata: one of the two is corrupt. Drop the
             // chunk rather than mixing them.
             datagramsIgnored++;
@@ -176,18 +229,18 @@ public final class FrameAssembler {
         }
 
         final int chunkIndex = pktChunkOffset / StreamProtocol.MAX_PAYLOAD;
-        if (seenChunks.get(chunkIndex)) {
+        if (slot.seen.get(chunkIndex)) {
             datagramsIgnored++;
             return;
         }
-        seenChunks.set(chunkIndex);
+        slot.seen.set(chunkIndex);
 
-        System.arraycopy(data, StreamProtocol.HEADER_SIZE, buffer, pktChunkOffset, pktChunkLen);
-        receivedBytes += pktChunkLen;
+        System.arraycopy(data, StreamProtocol.HEADER_SIZE, slot.buffer, pktChunkOffset, pktChunkLen);
+        slot.received += pktChunkLen;
         bytesReceived += pktChunkLen;
 
-        if (receivedBytes >= frameSize) {
-            completeFrame();
+        if (slot.received >= slot.size) {
+            completeFrame(slot);
         }
     }
 
@@ -199,44 +252,34 @@ public final class FrameAssembler {
         return (long) height * stride == frameSize;
     }
 
-    private void startFrame(int id, int size, int expectedCrc, long timestampUs, int width, int height, int stride,
-            int comp, int pixfmt) {
-        frameId = id;
-        frameSize = size;
-        frameCrc = expectedCrc;
-        frameTimestampUs = timestampUs;
-        frameWidth = width;
-        frameHeight = height;
-        frameStride = stride;
-        frameComp = comp;
-        framePixfmt = pixfmt;
-        receivedBytes = 0;
-        seenChunks.clear();
-        if (buffer.length < size) {
-            buffer = new byte[size];
+    private void completeFrame(Slot slot) {
+        slot.active = false;
+        if (slot == previous) {
+            // A straggler completed the older frame before the newer one finished,
+            // so showing it now is still in order.
+            framesCompletedLate++;
+        } else if (previous.active) {
+            // The newer frame finished first; the older one can no longer be shown in order.
+            previous.active = false;
+            framesIncomplete++;
         }
-        haveFrame = true;
-    }
-
-    private void completeFrame() {
-        haveFrame = false;
         haveCompleted = true;
-        lastCompletedFrameId = frameId;
+        lastCompletedFrameId = slot.id;
 
         crc.reset();
-        crc.update(buffer, 0, frameSize);
-        if ((int) crc.getValue() != frameCrc) {
+        crc.update(slot.buffer, 0, slot.size);
+        if ((int) crc.getValue() != slot.crc) {
             framesCrcFailed++;
             return;
         }
 
         framesCompleted++;
-        // Hand out a right-sized copy: the caller decodes it on another thread and our
-        // scratch buffer gets reused by the very next datagram.
-        final byte[] payload = new byte[frameSize];
-        System.arraycopy(buffer, 0, payload, 0, frameSize);
-        onFrame.accept(new Frame(payload, frameComp, framePixfmt, frameWidth, frameHeight, frameStride,
-                frameTimestampUs));
+        // Hand out a right-sized copy: the caller decodes it on another thread and the
+        // slot's buffer gets reused by a later frame.
+        final byte[] payload = new byte[slot.size];
+        System.arraycopy(slot.buffer, 0, payload, 0, slot.size);
+        onFrame.accept(new Frame(payload, slot.comp, slot.pixfmt, slot.width, slot.height, slot.stride,
+                slot.timestampUs));
     }
 
     /** Serial-number comparison, so the counter wrapping past 2^31 is not a discontinuity. */
@@ -262,5 +305,10 @@ public final class FrameAssembler {
 
     public long getBytesReceived() {
         return bytesReceived;
+    }
+
+    /** Frames saved by waiting for a chunk that arrived after the next frame had started. */
+    public long getFramesCompletedLate() {
+        return framesCompletedLate;
     }
 }

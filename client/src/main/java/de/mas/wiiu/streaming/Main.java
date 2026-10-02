@@ -119,7 +119,7 @@ public class Main {
 
         SwingUtilities.invokeLater(new Runnable() {
             public void run() {
-                new StreamWindow(imageStreamer.getImageProvider());
+                new StreamWindow(imageStreamer.getImageProvider(), imageStreamer::setAudioMuted);
             }
         });
     }

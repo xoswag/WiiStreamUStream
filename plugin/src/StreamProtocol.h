@@ -56,6 +56,21 @@
 #define STREAM_PING         0x15
 #define STREAM_PONG         0x16
 
+// --- Side channel: audio and status --------------------------------------------
+// Same UDP port as video, told apart by magic. A client that predates them sees
+// an unknown magic and ignores the datagram.
+
+#define STREAM_AUDIO_MAGIC           0x57555341u // 'W','U','S','A'
+#define STREAM_AUDIO_VERSION         1
+#define STREAM_AUDIO_HEADER_SIZE     32
+#define STREAM_AUDIO_CODEC_IMA_ADPCM 1 // 4 bits/sample; one byte per stereo frame, left in the low nibble
+
+#define STREAM_STATUS_MAGIC          0x57555353u // 'W','U','S','S'
+#define STREAM_STATUS_VERSION        1
+#define STREAM_STATUS_HEADER_SIZE    8
+// Keeps a status datagram inside the client's receive buffer (header + 1376).
+#define STREAM_STATUS_MAX_TEXT       1200
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -92,12 +107,46 @@ typedef struct __attribute__((packed)) StreamPacketHeader {
     uint16_t reserved;        // 42 must be 0
 } StreamPacketHeader;
 
+/**
+ * One block of audio. Each block carries the ADPCM decoder state it starts from,
+ * so it decodes on its own: a lost block costs its own 20 ms and nothing after.
+ * firstFrame numbers the block by sample frame, which lets the client fill a
+ * gap with exactly the silence it stands for.
+ */
+typedef struct __attribute__((packed)) StreamAudioHeader {
+    uint32_t magic;        // 0  STREAM_AUDIO_MAGIC
+    uint8_t  version;      // 4  STREAM_AUDIO_VERSION
+    uint8_t  codec;        // 5  STREAM_AUDIO_CODEC_*
+    uint8_t  channels;     // 6  always 2
+    uint8_t  reserved0;    // 7
+    uint32_t sampleRate;   // 8  Hz
+    uint32_t sequence;     // 12 +1 per block, free to wrap
+    uint32_t firstFrame;   // 16 sample-frame index of the block's first frame, free to wrap
+    uint16_t frames;       // 20 sample frames in the block (= payload bytes for stereo ADPCM)
+    uint16_t reserved1;    // 22
+    int16_t  predictor[2]; // 24 left, right: decoder state at the first frame
+    uint8_t  stepIndex[2]; // 28 left, right
+    uint16_t reserved2;    // 30
+} StreamAudioHeader;
+
+/** A plain-text status report: lines starting "settings", "state" and "perf". */
+typedef struct __attribute__((packed)) StreamStatusHeader {
+    uint32_t magic;   // 0 STREAM_STATUS_MAGIC
+    uint8_t  version; // 4 STREAM_STATUS_VERSION
+    uint8_t  kind;    // 5 0 = text
+    uint16_t length;  // 6 bytes of text that follow
+} StreamStatusHeader;
+
 #ifdef __cplusplus
 static_assert(sizeof(StreamPacketHeader) == STREAM_HEADER_SIZE,
               "StreamPacketHeader must be exactly 44 bytes on the wire");
+static_assert(sizeof(StreamAudioHeader) == STREAM_AUDIO_HEADER_SIZE, "StreamAudioHeader must be 32 bytes");
+static_assert(sizeof(StreamStatusHeader) == STREAM_STATUS_HEADER_SIZE, "StreamStatusHeader must be 8 bytes");
 #else
 _Static_assert(sizeof(StreamPacketHeader) == STREAM_HEADER_SIZE,
                "StreamPacketHeader must be exactly 44 bytes on the wire");
+_Static_assert(sizeof(StreamAudioHeader) == STREAM_AUDIO_HEADER_SIZE, "StreamAudioHeader must be 32 bytes");
+_Static_assert(sizeof(StreamStatusHeader) == STREAM_STATUS_HEADER_SIZE, "StreamStatusHeader must be 8 bytes");
 #endif
 
 #ifdef __cplusplus

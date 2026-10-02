@@ -2,7 +2,8 @@ name: client
 
 on:
   push:
-    branches: ["**"]
+    # ci-log/* branches are written by the workflows themselves.
+    branches: ["**", "!ci-log/**"]
     paths:
       - "client/**"
       - ".github/workflows/client.yml"
@@ -11,6 +12,10 @@ on:
       - "client/**"
       - ".github/workflows/client.yml"
   workflow_dispatch:
+
+# contents: write only so the job can publish its build log to a ci-log/* branch.
+permissions:
+  contents: write
 
 defaults:
   run:
@@ -31,8 +36,9 @@ jobs:
           # has to be pointed at it explicitly.
           cache-dependency-path: client/pom.xml
 
-      - name: Build
-        run: mvn -B -ntp package
+      - name: Build and test
+        shell: bash # pipefail, so a failing build still fails the step through tee
+        run: mvn -B -ntp package 2>&1 | tee build.log
 
       - uses: actions/upload-artifact@v4
         with:
@@ -41,3 +47,12 @@ jobs:
           name: WiiStreamUStream-Client
           path: client/target/WiiStreamUStream-Client-*-app.jar
           if-no-files-found: error
+
+      # Private repository: publish the log where `git fetch` can read it.
+      - name: Publish the build log
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOG_BRANCH: ci-log/client
+          JOB_STATUS: ${{ job.status }}
+        run: bash ../.github/publish-log.sh build.log

@@ -82,6 +82,13 @@ void StopThread();
 /** Copies a finished frame into the pending slot and wakes the sender. */
 bool Submit(const uint8_t *payload, uint32_t size, const FrameMeta &meta);
 
+/**
+ * Sends one small datagram (an audio block, a status report) to the connected
+ * client on a socket of its own, so it never waits behind a video frame. Drops
+ * rather than queues when the network is congested. Safe from any thread.
+ */
+bool SendSide(const void *data, uint32_t length);
+
 // --- Instrumentation. Monotonic counters, read on the encoder's report tick. --
 uint32_t GetFramesSent();
 uint64_t GetBytesSent();     // frame payload bytes only (for average KB/frame)

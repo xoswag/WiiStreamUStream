@@ -100,8 +100,10 @@ constexpr int WANTED_SEND_BUFFER = 4 * 1024 * 1024;
  */
 constexpr uint32_t FRAME_SEND_BUDGET_MS = 200;
 
-/** Secondary bound, so one wedged datagram cannot eat the whole frame budget. */
-constexpr int MAX_SEND_RETRIES = 20;
+// The side channel (audio, status) has its own socket and lock, so a 20 ms audio
+// block never waits behind a whole video frame that holds sMutex.
+OSFastMutex sSideMutex;
+int sSideSocket = -1;
 
 void closeLocked() {
     if (sSocket >= 0) {
@@ -110,9 +112,19 @@ void closeLocked() {
     }
 }
 
-/** Sends one datagram whole, retrying while the stack is congested. */
+/**
+ * Sends one datagram whole, retrying while the stack is congested, until the
+ * frame's deadline.
+ *
+ * There used to be a second, per-datagram cap of 20 retries (10 ms) as well.
+ * That made sense while sending blocked the encoder, but sending has its own
+ * thread now, and a frame abandoned halfway is the worst outcome there is: the
+ * bandwidth for the first half is spent and the client throws all of it away.
+ * Pushing through a brief Wi-Fi stall and letting a newer frame replace the
+ * pending one is strictly better.
+ */
 bool sendDatagram(const uint8_t *data, uint32_t length, OSTime deadline) {
-    for (int attempt = 0; attempt < MAX_SEND_RETRIES; attempt++) {
+    for (;;) {
         const int ret = send(sSocket, data, (int) length, 0);
         if (ret == (int) length) {
             return true;
@@ -133,7 +145,6 @@ bool sendDatagram(const uint8_t *data, uint32_t length, OSTime deadline) {
         // Congested rather than broken - let the stack drain and try again.
         OSSleepTicks(OSMicrosecondsToTicks(500));
     }
-    return false;
 }
 
 int senderEntry(int /*argc*/, const char ** /*argv*/) {
@@ -176,6 +187,7 @@ void InitOnce() {
     OSFastMutex_Init(&sMutex, "StreamSender");
     OSFastMutex_Init(&sStatsMutex, "StreamSender stats");
     OSFastMutex_Init(&sPendingMutex, "StreamSender pending");
+    OSFastMutex_Init(&sSideMutex, "StreamSender side");
 }
 
 bool Open(uint32_t clientIp) {
@@ -251,6 +263,28 @@ bool Open(uint32_t clientIp) {
     OSFastMutex_Lock(&sPendingMutex);
     sPendingValid = false;
     OSFastMutex_Unlock(&sPendingMutex);
+
+    // The side channel to the same client. Best effort: without it the stream
+    // still works, just without audio and status reports.
+    OSFastMutex_Lock(&sSideMutex);
+    if (sSideSocket >= 0) {
+        close(sSideSocket);
+        sSideSocket = -1;
+    }
+    const int side = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (side >= 0) {
+        int sideNonBlocking = 1;
+        setsockopt(side, SOL_SOCKET, SO_NONBLOCK, &sideNonBlocking, sizeof(sideNonBlocking));
+        if (connect(side, (struct sockaddr *) &addr, sizeof(addr)) == 0) {
+            sSideSocket = side;
+        } else {
+            close(side);
+        }
+    }
+    if (sSideSocket < 0) {
+        DEBUG_FUNCTION_LINE_WARN("Could not open the audio/status socket (errno %d)", errno);
+    }
+    OSFastMutex_Unlock(&sSideMutex);
     DEBUG_FUNCTION_LINE("Streaming to %u.%u.%u.%u:%d",
                         (clientIp >> 24) & 0xFF, (clientIp >> 16) & 0xFF,
                         (clientIp >> 8) & 0xFF, clientIp & 0xFF, STREAM_UDP_PORT);
@@ -261,6 +295,35 @@ void Close() {
     OSFastMutex_Lock(&sMutex);
     closeLocked();
     OSFastMutex_Unlock(&sMutex);
+
+    OSFastMutex_Lock(&sSideMutex);
+    if (sSideSocket >= 0) {
+        close(sSideSocket);
+        sSideSocket = -1;
+    }
+    OSFastMutex_Unlock(&sSideMutex);
+}
+
+bool SendSide(const void *data, uint32_t length) {
+    bool ok = false;
+    OSFastMutex_Lock(&sSideMutex);
+    if (sSideSocket >= 0) {
+        // A few short retries only: an audio block or status report that cannot
+        // go out within ~2 ms is better dropped than queued behind.
+        for (int attempt = 0; attempt < 8; attempt++) {
+            const int ret = send(sSideSocket, data, (int) length, 0);
+            if (ret == (int) length) {
+                ok = true;
+                break;
+            }
+            if (ret >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS)) {
+                break;
+            }
+            OSSleepTicks(OSMicrosecondsToTicks(250));
+        }
+    }
+    OSFastMutex_Unlock(&sSideMutex);
+    return ok;
 }
 
 bool IsOpen() {

@@ -12,6 +12,7 @@
  * GNU General Public License for more details.
  ****************************************************************************/
 #include "ControlServer.hpp"
+#include "StatusReport.hpp"
 #include "StreamProtocol.h"
 #include "StreamSender.hpp"
 #include "retain_vars.hpp"
@@ -124,8 +125,19 @@ void serveClient(int clientSocket, uint32_t clientIp) {
 
     DEBUG_FUNCTION_LINE("Client connected");
 
+    // The status report rides on this loop: it already wakes every 250 ms, and a
+    // report is only worth sending while someone is connected to read it.
+    StatusReport::Reset();
+    OSTime lastStatus = OSGetSystemTime();
+
     int idleMs = 0;
     while (!sShouldExit) {
+        const OSTime now = OSGetSystemTime();
+        if (now - lastStatus >= (OSTime) OSMillisecondsToTicks(1000)) {
+            lastStatus = now;
+            StatusReport::Send();
+        }
+
         const int ready = waitReadable(clientSocket, POLL_INTERVAL_MS);
         if (ready < 0) {
             DEBUG_FUNCTION_LINE("select failed (errno %d), dropping the client", errno);

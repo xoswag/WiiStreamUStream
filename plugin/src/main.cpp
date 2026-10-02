@@ -14,6 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ****************************************************************************/
+#include "AudioCapture.hpp"
 #include "ControlServer.hpp"
 #include "ImageEncoder.hpp"
 #include "ScreenCapture.hpp"
@@ -60,8 +61,13 @@ void startPipeline() {
         ScreenCapture::Shutdown();
         return;
     }
+    // Not fatal: video works without it.
+    if (!AudioCapture::Start()) {
+        DEBUG_FUNCTION_LINE_ERR("Failed to start the audio thread; streaming video only");
+    }
     if (!ImageEncoder::Start()) {
         DEBUG_FUNCTION_LINE_ERR("Failed to start the encoder");
+        AudioCapture::Stop();
         StreamSender::StopThread();
         ScreenCapture::Shutdown();
         return;
@@ -69,6 +75,7 @@ void startPipeline() {
     if (!ControlServer::Start()) {
         DEBUG_FUNCTION_LINE_ERR("Failed to start the control server");
         ImageEncoder::Stop();
+        AudioCapture::Stop();
         StreamSender::StopThread();
         ScreenCapture::Shutdown();
         return;
@@ -98,6 +105,9 @@ void stopPipeline() {
 
     ControlServer::Stop();
     ImageEncoder::Stop();
+    // The audio thread only reads its own ring (fed by the title's mixer, which
+    // the closed gates have already silenced) and sends on the side socket.
+    AudioCapture::Stop();
     // After the encoder (nothing can Submit any more), before the capture
     // buffers go: the sender only ever touches its own copies of a frame.
     StreamSender::StopThread();

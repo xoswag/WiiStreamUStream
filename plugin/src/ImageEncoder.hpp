@@ -31,4 +31,23 @@ void Stop();
 
 bool IsRunning();
 
+constexpr int MAX_ENCODER_CORES = 3;
+
+/** Cumulative counters (free to wrap - take differences), readable from any thread in any build. */
+struct Stats {
+    uint32_t framesEncoded;
+    uint32_t framesDropped; // encoded but given up (a follower missed the deadline, a failure)
+    uint32_t gpuTimeouts;
+    uint32_t frameUsTotal;  // wall time per encoded frame, summed
+    uint32_t bandsTotal;    // bands per encoded frame, summed
+    uint32_t width;         // of the last frame
+    uint32_t height;
+    int32_t coreCount;
+    int32_t core[MAX_ENCODER_CORES];          // [0] leads
+    uint32_t benched[MAX_ENCODER_CORES];      // followers only
+    uint32_t bandLatencyUs[MAX_ENCODER_CORES]; // followers only: last band, dispatch to done
+};
+
+void GetStats(Stats &out);
+
 } // namespace ImageEncoder
