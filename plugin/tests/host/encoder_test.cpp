@@ -523,9 +523,19 @@ std::mutex gQMutex;
 std::condition_variable gQCv;
 std::deque<fakes::Submitted> gQueue;
 std::atomic<bool> gVerifying{true};
+// While set, verification waits: on a small CI runner the verifier would
+// otherwise compete with the very encoder threads whose speed decides whether a
+// follower is let in.
+std::atomic<bool> gHold{false};
 std::atomic<int> gInFlight{0};
+std::atomic<uint32_t> gSplicedSubmitted{0};
+std::mutex gPsnrMutex;
+double gMinPsnr = 99.0;
 
 void onSubmit(fakes::Submitted &&f) {
+    if (hasRestartInterval(f.jpeg)) {
+        gSplicedSubmitted++;
+    }
     std::lock_guard<std::mutex> l(gQMutex);
     gQueue.push_back(std::move(f));
     gInFlight++;
@@ -585,7 +595,15 @@ void verifyOne(tjhandle ctj, tjhandle dtj, const fakes::Submitted &f) {
     const bool rawBytes = f.path == WUPS_STREAMING_PATH_SAFE && dw == sw && dh == sh && !f.srgb;
     if (!rawBytes) {
         const double q = psnr(got, idealDownscale(f.frameId, sw, sh, dw, dh, f.srgb));
-        if (q < 22.0) {
+        {
+            std::lock_guard<std::mutex> l(gPsnrMutex);
+            gMinPsnr = std::min(gMinPsnr, q);
+        }
+        // Gross errors (swapped planes, misplaced bands, wrong rows) land far below
+        // this. A tiny frame scores lower on its own: there, a few sharp-edged
+        // blocks are most of the picture.
+        const double floor = (uint64_t) dw * dh < 65536 ? 16.0 : 22.0;
+        if (q < floor) {
             printf("FAIL frame %u: PSNR %.1f dB against the ideal downscale\n", f.frameId, q);
             gStats.bad++;
             return;
@@ -601,7 +619,7 @@ void verifierLoop() {
         fakes::Submitted f;
         {
             std::unique_lock<std::mutex> l(gQMutex);
-            gQCv.wait(l, [] { return !gQueue.empty() || !gVerifying; });
+            gQCv.wait(l, [] { return (!gQueue.empty() && !gHold) || !gVerifying; });
             if (gQueue.empty()) {
                 break;
             }
@@ -616,6 +634,8 @@ void verifierLoop() {
 }
 
 void drainVerifier() {
+    gHold = false;
+    gQCv.notify_all();
     while (gInFlight.load() > 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
@@ -667,31 +687,44 @@ void beginScenario(const Scenario &s) {
     fakes::captureSetup(s.sw, s.sh, s.srgb);
     testhooks::resetLogCounts();
     gStats.verified = gStats.multiBand = gStats.safe = gStats.bad = 0;
+    gSplicedSubmitted = 0;
+    std::lock_guard<std::mutex> l(gPsnrMutex);
+    gMinPsnr = 99.0;
 }
 
 void endScenario(const char *name) {
     drainVerifier();
     fakes::captureTeardown();
-    printf("   %s: %u frames verified (%u spliced from several cores, %u safe path), %u bad\n", name,
-           gStats.verified.load(), gStats.multiBand.load(), gStats.safe.load(), gStats.bad.load());
+    printf("   %s: %u frames verified (%u spliced from several cores, %u safe path), %u bad, worst PSNR %.1f dB\n",
+           name, gStats.verified.load(), gStats.multiBand.load(), gStats.safe.load(), gStats.bad.load(), gMinPsnr);
     CHECK(gStats.bad == 0, "%s: %u frames failed verification", name, gStats.bad.load());
     CHECK(gStats.verified > 0, "%s: no frames verified", name);
 }
 
-void scenarioSteady(const Scenario &s, bool requireMultiBand) {
+enum class Split { Never, Expected, Required };
+
+void scenarioSteady(const Scenario &s, Split split) {
     beginScenario(s);
+    gHold = true;
     CHECK(ImageEncoder::Start(), "Start failed");
     fakes::producerStart(0);
-    // Long enough for a follower's first trial band and then plenty of frames.
-    for (int i = 0; i < 15 && gStats.multiBand < 30; i++) {
-        waitForFrames(10, 4000);
+    // At least 150 frames; where frames can be split, keep going (up to 20 s)
+    // until a follower has been through its trial and helped with a good number.
+    const auto deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    const uint32_t first = fakes::submittedCount();
+    while (std::chrono::steady_clock::now() < deadline) {
+        const bool enough = fakes::submittedCount() - first >= 150;
+        if (enough && (split == Split::Never || gSplicedSubmitted >= 30)) {
+            break;
+        }
+        runFor(20);
     }
     fakes::producerStop();
     stopEncoder(s.name);
     drainVerifier();
-    if (requireMultiBand) {
+    if (split == Split::Required) {
         CHECK(gStats.multiBand > 0, "%s: no frame was ever split across cores", s.name);
-    } else if (gStats.multiBand == 0) {
+    } else if (split == Split::Expected && gStats.multiBand == 0) {
         warn("no multi-core frames in a scenario that allows them");
     }
     endScenario(s.name);
@@ -797,12 +830,12 @@ int main() {
     const Scenario safe360  = {"SAFE path, 1280x720 -> 640x360, sRGB", 1280, 720, true, WUPS_STREAMING_CORES_0_2,
                                WUPS_STREAMING_SIZE_360P, WUPS_STREAMING_PATH_SAFE};
 
-    scenarioSteady(two360, true);
-    scenarioSteady(all480, false);
-    scenarioSteady(native, false);
-    scenarioSteady(odd, false);
-    scenarioSteady(tiny, false);
-    scenarioSteady(safe360, false);
+    scenarioSteady(two360, Split::Required);
+    scenarioSteady(all480, Split::Required);
+    scenarioSteady(native, Split::Expected);
+    scenarioSteady(odd, Split::Expected);
+    scenarioSteady(tiny, Split::Never);
+    scenarioSteady(safe360, Split::Never);
     scenarioStarved();
     scenarioGpuFallback();
     scenarioChurn();

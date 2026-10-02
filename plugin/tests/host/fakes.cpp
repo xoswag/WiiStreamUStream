@@ -20,6 +20,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -44,6 +45,9 @@ std::atomic<uint32_t> sLastReleased{0};
 std::atomic<int> sGpuFailures{0};
 std::atomic<int> sErrors{0};
 std::atomic<uint32_t> sPresented{0}, sCaptured{0};
+
+constexpr uint32_t CONTENT_CYCLE = 16;
+std::vector<uint32_t> sCache[CONTENT_CYCLE];
 
 fakes::SubmitHandler sHandler = nullptr;
 std::atomic<uint32_t> sSubmitted{0};
@@ -83,9 +87,14 @@ void producerLoop(uint32_t pacingUs) {
             sFree.pop_front();
             sState[idx] = SlotState::Filling;
         }
-        const uint32_t id = sNextFrame++;
-        GX2Surface &s     = sSlots[idx].colorBuffer.surface;
-        fakes::fillFrame((uint32_t *) s.image, sWidth, sHeight, sPitch, id);
+        const uint32_t id             = sNextFrame++;
+        GX2Surface &s                 = sSlots[idx].colorBuffer.surface;
+        std::vector<uint32_t> &cached = sCache[id % CONTENT_CYCLE];
+        if (cached.empty()) {
+            cached.resize((size_t) sPitch * sHeight);
+            fakes::fillFrame(cached.data(), sWidth, sHeight, sPitch, id);
+        }
+        memcpy(s.image, cached.data(), cached.size() * sizeof(uint32_t));
         sSlots[idx].sourceIsSRGB = sSrgb;
         sSlots[idx].gpuTimestamp = 1;
         {
@@ -109,7 +118,11 @@ void producerLoop(uint32_t pacingUs) {
 
 namespace fakes {
 
-void fillFrame(uint32_t *pixels, uint32_t width, uint32_t height, uint32_t pitch, uint32_t id) {
+void fillFrame(uint32_t *pixels, uint32_t width, uint32_t height, uint32_t pitch, uint32_t frameId) {
+    // Content repeats every CONTENT_CYCLE frames, so the producer can replay
+    // cached frames instead of burning a CPU the encoder threads need.
+    // Consecutive frames still always differ.
+    const uint32_t id  = frameId % CONTENT_CYCLE;
     const uint32_t sqW = width / 8 + 1, sqH = height / 8 + 1;
     const uint32_t sqX = (id * 7) % width, sqY = (id * 3) % height;
     for (uint32_t y = 0; y < height; y++) {
@@ -143,6 +156,9 @@ void captureSetup(uint32_t width, uint32_t height, bool srgb) {
     // GX2 pads a linear-aligned 32bpp surface's pitch to a multiple of 64 pixels.
     sPitch = (width + 63) & ~63u;
     sSrgb  = srgb;
+    for (auto &c : sCache) {
+        c.clear();
+    }
     sFree.clear();
     sReady.clear();
     for (int i = 0; i < CAPTURE_SLOT_COUNT; i++) {
