@@ -1,0 +1,53 @@
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] -------------< com.github.xoswag:wiistreamustream-client >--------------
+[INFO] Building WiiStreamUStream Client 0.2.0
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ wiistreamustream-client ---
+[INFO] skip non existing resourceDirectory /home/runner/work/WiiStreamUStream/WiiStreamUStream/client/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.13.0:compile (default-compile) @ wiistreamustream-client ---
+[INFO] Recompiling the module because of changed source code.
+[INFO] Compiling 15 source files with javac [debug release 11] to target/classes
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ wiistreamustream-client ---
+[INFO] skip non existing resourceDirectory /home/runner/work/WiiStreamUStream/WiiStreamUStream/client/src/test/resources
+[INFO] 
+[INFO] --- compiler:3.13.0:testCompile (default-testCompile) @ wiistreamustream-client ---
+[INFO] Recompiling the module because of changed dependency.
+[INFO] Compiling 2 source files with javac [debug release 11] to target/test-classes
+[INFO] 
+[INFO] --- surefire:3.2.5:test (default-test) @ wiistreamustream-client ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running de.mas.wiiu.streaming.network.FrameAssemblerTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.054 s -- in de.mas.wiiu.streaming.network.FrameAssemblerTest
+[INFO] Running de.mas.wiiu.streaming.audio.ImaAdpcmTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in de.mas.wiiu.streaming.audio.ImaAdpcmTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] --- jar:3.5.0:jar (default-jar) @ wiistreamustream-client ---
+[INFO] Building jar: /home/runner/work/WiiStreamUStream/WiiStreamUStream/client/target/wiistreamustream-client-0.2.0.jar
+[INFO] 
+[INFO] --- assembly:3.7.1:single (make-assembly) @ wiistreamustream-client ---
+[INFO] Building jar: /home/runner/work/WiiStreamUStream/WiiStreamUStream/client/target/WiiStreamUStream-Client-0.2.0-app.jar
+[WARNING] Configuration option 'appendAssemblyId' is set to false.
+Instead of attaching the assembly file: /home/runner/work/WiiStreamUStream/WiiStreamUStream/client/target/WiiStreamUStream-Client-0.2.0-app.jar, it will become the file for main project artifact.
+NOTE: If multiple descriptors or descriptor-formats are provided for this project, the value of this file will be non-deterministic!
+[WARNING] Replacing pre-existing project main-artifact file: /home/runner/work/WiiStreamUStream/WiiStreamUStream/client/target/wiistreamustream-client-0.2.0.jar
+with assembly file: /home/runner/work/WiiStreamUStream/WiiStreamUStream/client/target/WiiStreamUStream-Client-0.2.0-app.jar
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  5.071 s
+[INFO] Finished at: 2026-10-03T02:04:25Z
+[INFO] ------------------------------------------------------------------------
