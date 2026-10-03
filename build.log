@@ -1,0 +1,235 @@
+--- building libjpeg-turbo 3.1.0
+Note: switching to '20ade4dea9589515a69793e447a6c6220b464535'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+/home/runner/work/WiiStreamUStream/WiiStreamUStream/plugin/tests/host/build/ljt-src/src/jchuff.c: In function ‘jpeg_gen_optimal_table’:
+/home/runner/work/WiiStreamUStream/WiiStreamUStream/plugin/tests/host/build/ljt-src/src/jchuff.c:1046:22: warning: writing 1 byte into a region of size 0 [-Wstringop-overflow=]
+ 1046 |     bits[codesize[i]]++;
+      |     ~~~~~~~~~~~~~~~~~^~
+/home/runner/work/WiiStreamUStream/WiiStreamUStream/plugin/tests/host/build/ljt-src/src/jchuff.c:949:9: note: at offset 33 into destination object ‘bits’ of size 33
+  949 |   UINT8 bits[MAX_CLEN + 1];     /* bits[k] = # of symbols with code length k */
+      |         ^~~~
+/home/runner/work/WiiStreamUStream/WiiStreamUStream/plugin/tests/host/build/ljt-src/src/jchuff.c: In function ‘jpeg_gen_optimal_table’:
+/home/runner/work/WiiStreamUStream/WiiStreamUStream/plugin/tests/host/build/ljt-src/src/jchuff.c:1046:22: warning: writing 1 byte into a region of size 0 [-Wstringop-overflow=]
+ 1046 |     bits[codesize[i]]++;
+      |     ~~~~~~~~~~~~~~~~~^~
+/home/runner/work/WiiStreamUStream/WiiStreamUStream/plugin/tests/host/build/ljt-src/src/jchuff.c:949:9: note: at offset 33 into destination object ‘bits’ of size 33
+  949 |   UINT8 bits[MAX_CLEN + 1];     /* bits[k] = # of symbols with code length k */
+      |         ^~~~
+--- compiling (release configuration, warnings only)
+--- compiling (debug, AddressSanitizer + UndefinedBehaviorSanitizer)
+--- running
+== YuvConvert vs model
+   1280x720  ->  640x360  srgb=0  max |dY| 1  max |dC| 1  ok
+   1280x720  ->  640x360  srgb=1  max |dY| 1  max |dC| 1  ok
+   1280x720  -> 1280x720  srgb=0  max |dY| 1  max |dC| 1  ok
+   1280x720  ->  426x240  srgb=0  max |dY| 1  max |dC| 1  ok
+   1280x720  ->  854x480  srgb=1  max |dY| 1  max |dC| 1  ok
+   1280x720  ->  320x180  srgb=0  max |dY| 1  max |dC| 1  ok
+    960x540  ->  320x180  srgb=1  max |dY| 1  max |dC| 1  ok
+    853x479  ->  853x479  srgb=0  max |dY| 1  max |dC| 1  ok
+    101x67   ->   50x33   srgb=0  max |dY| 1  max |dC| 0  ok
+     64x64   ->   21x21   srgb=1  max |dY| 0  max |dC| 0  ok
+    854x480  ->  640x360  srgb=0  max |dY| 1  max |dC| 1  ok
+== JpegStitch vs one-shot encode
+    640x360  x2 q55: 8384 bytes spliced vs 8376 one-shot - bit-exact
+    640x360  x3 q55: 8386 bytes spliced vs 8376 one-shot - bit-exact
+   1280x720  x2 q55: 22234 bytes spliced vs 22226 one-shot - bit-exact
+   1280x720  x3 q80: 59599 bytes spliced vs 59608 one-shot - bit-exact
+   1280x720  x8 q30: 16935 bytes spliced vs 16914 one-shot - bit-exact
+    854x480  x3 q55: 11736 bytes spliced vs 11726 one-shot - bit-exact
+    320x180  x2 q55: 3016 bytes spliced vs 3008 one-shot - bit-exact
+    853x479  x3 q55: 11849 bytes spliced vs 11840 one-shot - bit-exact
+    100x50   x2 q90: 1768 bytes spliced vs 1758 one-shot - bit-exact
+    426x240  x3 q10: 2482 bytes spliced vs 2471 one-shot - bit-exact
+== ADPCM encoder vs reference vector
+   64 stereo frames: bit-exact with the reference
+== AudioRing: producer/consumer under contention
+   2880000 frames through, 0 writes refused while full, 0 wrong
+== cores 0+2, 1280x720 -> 640x360 (exact 2:1)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 21421 ns/row vs leader 19923 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   cores 0+2, 1280x720 -> 640x360 (exact 2:1): 174 frames verified (34 spliced from several cores, 0 safe path), 0 bad, worst PSNR 39.4 dB
+== all three cores, 1280x720 -> 854x480 (general ratio), sRGB
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 3 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 1 rejoins: trial band at 53337 ns/row vs leader 48535 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 62829 ns/row vs leader 48535 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                         bench@L0787: Benching core 2: consistently slower than the leader (next trial in 2000 ms)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                         bench@L0787: Benching core 1: consistently slower than the leader (next trial in 2000 ms)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 35012 ns/row vs leader 35748 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   all three cores, 1280x720 -> 854x480 (general ratio), sRGB: 167 frames verified (34 spliced from several cores, 0 safe path), 0 bad, worst PSNR 39.4 dB
+== cores 0+2, native 1280x720
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 38989 ns/row vs leader 26100 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   cores 0+2, native 1280x720: 153 frames verified (152 spliced from several cores, 0 safe path), 0 bad, worst PSNR 38.6 dB
+== cores 0+2, odd native 853x479
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 32554 ns/row vs leader 25709 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   cores 0+2, odd native 853x479: 152 frames verified (151 spliced from several cores, 0 safe path), 0 bad, worst PSNR 37.7 dB
+== all three cores, 64x24 (too short to split)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 3 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   all three cores, 64x24 (too short to split): 248 frames verified (0 spliced from several cores, 0 safe path), 0 bad, worst PSNR 27.2 dB
+== SAFE path, 1280x720 -> 640x360, sRGB
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   SAFE path, 1280x720 -> 640x360, sRGB: 152 frames verified (0 spliced from several cores, 152 safe path), 0 bad, worst PSNR 39.6 dB
+== core 2 starved by the game, then freed
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 37760 ns/row vs leader 30105 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                         bench@L0787: Benching core 2: missed the frame deadline (next trial in 2000 ms)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1121: [fps] present 248 | capture 147 | encode 147 | tx 147   (enc-busy 0/s, dropped 1, gpu-timeouts 0, send-replaced 0, sendfail 0 total)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1125: [cost] frame 6.70 ms (gpu wait 0.00, lead band: convert 4.62 + jpeg 1.95, splice 0.00) | send 0.00 ms | 9.92 Mbit/s | 7 KB | 640x360
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1149: [cores] FAST, 1.1 bands/frame | core0 leads core2 benched (trial 146.11 ms) | cpu-check 144 us
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1121: [fps] present 259 | capture 138 | encode 138 | tx 138   (enc-busy 0/s, dropped 0, gpu-timeouts 0, send-replaced 0, sendfail 0 total)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1125: [cost] frame 7.21 ms (gpu wait 0.00, lead band: convert 5.04 + jpeg 2.14, splice 0.00) | send 0.00 ms | 9.32 Mbit/s | 7 KB | 640x360
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1149: [cores] FAST, 1.0 bands/frame | core0 leads core2 benched (trial 6.83 ms) | cpu-check 136 us
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 21322 ns/row vs leader 19897 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1121: [fps] present 262 | capture 147 | encode 147 | tx 147   (enc-busy 0/s, dropped 0, gpu-timeouts 0, send-replaced 0, sendfail 0 total)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1125: [cost] frame 6.79 ms (gpu wait 0.00, lead band: convert 4.69 + jpeg 1.99, splice 0.00) | send 0.00 ms | 9.90 Mbit/s | 7 KB | 640x360
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        report@L1149: [cores] FAST, 1.1 bands/frame | core0 leads core2 3.97 ms/band | cpu-check 135 us
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   joined before starvation: yes, bench events while starved: 1, rejoin events overall: 2
+   core 2 starved by the game, then freed: 2562 frames verified (616 spliced from several cores, 0 safe path), 0 bad, worst PSNR 39.4 dB
+== GPU copies never retire -> blocking fallback
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1201: ##WARN ## GPU copies are not retiring in time; falling back to blocking GPU sync for this title
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   GPU copies never retire -> blocking fallback: 22 frames verified (0 spliced from several cores, 0 safe path), 0 bad, worst PSNR 37.2 dB
+== stop/start churn while frames keep arriving
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 2
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 1
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 25838 ns/row vs leader 23575 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 20572 ns/row vs leader 20838 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 3 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 2
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 3 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 26447 ns/row vs leader 33808 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 1 rejoins: trial band at 42598 ns/row vs leader 33808 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                         bench@L0787: Benching core 2: missed the frame deadline (next trial in 2000 ms)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 3 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 22864 ns/row vs leader 32316 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 1 rejoins: trial band at 46614 ns/row vs leader 32316 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 1
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 24914 ns/row vs leader 24470 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                         bench@L0787: Benching core 2: consistently slower than the leader (next trial in 2000 ms)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 1
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 2
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 2
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 1
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 54391 ns/row vs leader 43951 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                         bench@L0787: Benching core 2: missed the frame deadline (next trial in 2000 ms)
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 3 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 26929 ns/row vs leader 34383 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 1 rejoins: trial band at 47492 ns/row vs leader 34383 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 2
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 3 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 26375 ns/row vs leader 34555 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 1 rejoins: trial band at 46218 ns/row vs leader 34555 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 44523 ns/row vs leader 34904 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 2 core(s), leader on core 0
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                        onDone@L0823: Core 2 rejoins: trial band at 31573 ns/row vs leader 30652 ns/row
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 2
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1161: Encoder running: 1 core(s), leader on core 2
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                   leaderEntry@L1289: Encoder stopping
+[(P)   ScreenStreaming][       ImageEncoder.cpp]                          Stop@L1498: Encoder stopped
+   churn: 1618 frames verified (663 spliced from several cores, 338 safe path), 0 bad, worst PSNR 37.2 dB
+
+PASSED: 0 failure(s), 0 warning(s)
